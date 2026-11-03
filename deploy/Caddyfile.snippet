@@ -1,0 +1,16 @@
+# Paste INSIDE the existing site block of /etc/caddy/Caddyfile.
+# BEGIN mac-relay
+handle_path /relay/* {
+	request_body {
+		max_size 512MB
+	}
+	reverse_proxy 127.0.0.1:18790 {
+		# long-poll requests hold up to ~55s
+		transport http {
+			read_timeout 120s
+			write_timeout 300s
+		}
+		flush_interval -1
+	}
+}
+# END mac-relay

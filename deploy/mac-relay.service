@@ -1,0 +1,21 @@
+[Unit]
+Description=mac-relay task relay
+After=network.target
+
+[Service]
+User=mac-relay
+Environment=RELAY_BIND=127.0.0.1
+Environment=RELAY_PORT=18790
+Environment=RELAY_DATA_DIR=/var/lib/mac-relay
+Environment=RELAY_SECRET_FILE=/etc/mac-relay/secret
+ExecStart=/usr/bin/python3 /opt/mac-relay/relay/server.py
+Restart=on-failure
+RestartSec=3
+StateDirectory=mac-relay
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mac-relay
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__INSTALL_DIR__/relay-worker.py</string>
+    <string>__CONFIG_PATH__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>__PATH__</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <!-- tasks run in their own session; do not kill them when the worker restarts -->
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>__LOG_DIR__/worker.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/worker.log</string>
+</dict>
+</plist>

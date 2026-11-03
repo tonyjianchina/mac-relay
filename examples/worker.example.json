@@ -1,0 +1,15 @@
+{
+  "primary_url": "https://relay.example.com/relay",
+  "fallback_url": "http://100.64.0.1:18790",
+  "secret_file": "~/.config/mac-relay/secret",
+  "state_dir": "~/Library/Application Support/mac-relay",
+  "worker_name": "mac",
+  "fail_threshold": 3,
+  "cooldown_s": 300,
+  "max_backoff_s": 60,
+  "tools": {
+    "hermes":   ["/path/to/hermes", "run", "--prompt-file", "{prompt_file}", "--out", "{outbox}"],
+    "deepseek": ["/path/to/deepseek-harness", "--prompt-file", "{prompt_file}", "--inbox", "{inbox}"],
+    "codex":    ["codex", "exec", "-m", "gpt-6.1-sol", "{prompt}"]
+  }
+}

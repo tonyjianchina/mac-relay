@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Long-polls the relay for finished tasks, downloads files, writes result.json, sends ONE wake.
+Env: RELAY_URL, RELAY_SECRET_FILE, RELAY_RESULTS_DIR (/workspace/relay-results),
+RELAY_WAKE_DIR (/workspace/relay/wake). Run under nohup/supervisor; not a cron job."""
+import json, os, sys, time, urllib.parse, urllib.request
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from relay.client import request, secret
+
+URL = os.environ["RELAY_URL"]
+RES = os.environ.get("RELAY_RESULTS_DIR", "/workspace/relay-results")
+WAKE = os.environ.get("RELAY_WAKE_DIR", "/workspace/relay/wake")
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+def wake(t, rdir):
+    url_f, key_f = os.path.join(WAKE, t["sender"] + ".url"), os.path.join(WAKE, t["sender"] + ".key")
+    try:
+        url = open(url_f).read().strip(); key = open(key_f).read().strip()
+    except OSError:
+        log("ERROR no wake url/key for sender", t["sender"], "- task", t["id"], "not announced"); return "missing"
+    body = json.dumps({"task_id": t["id"], "status": t["status"], "summary": t["summary"],
+                       "sender": t["sender"], "result_path": rdir}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return f"http {r.status}"
+    except Exception as e:
+        log("ERROR wake failed for", t["id"], type(e).__name__); return "error"
+
+def handle(sec, t):
+    rdir = os.path.join(RES, t["id"]); os.makedirs(rdir, exist_ok=True)
+    marker = os.path.join(rdir, ".wake")
+    if not os.path.exists(marker):
+        paths = []
+        for n in t["files"]:
+            _, data = request(URL, sec, "GET", f"/files/{urllib.parse.quote(t['id'])}/out/{urllib.parse.quote(n)}")
+            p = os.path.join(rdir, n)
+            with open(p, "wb") as f: f.write(data)
+            paths.append(p)
+        json.dump({"task_id": t["id"], "sender": t["sender"], "tool": t["tool"], "status": t["status"],
+                   "summary": t["summary"], "files": paths}, open(os.path.join(rdir, "result.json"), "w"), indent=1)
+        open(marker, "w").write("attempting\n")  # at-most-once: written BEFORE the POST
+        res = wake(t, rdir)
+        open(marker, "w").write(res + "\n")
+        log("delivered", t["id"], t["status"], "wake:", res)
+    request(URL, sec, "POST", f"/results/{urllib.parse.quote(t['id'])}/ack", b"{}", "application/json")
+
+def main():
+    sec, backoff = secret(), 1
+    while True:
+        try:
+            st, j = request(URL, sec, "GET", "/results/next?wait=50")
+            backoff = 1
+            if st == 200:
+                handle(sec, j["task"])
+        except Exception as e:
+            log("relay unreachable:", type(e).__name__, "retry in", backoff); time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+if __name__ == "__main__":
+    main()

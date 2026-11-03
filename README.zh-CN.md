@@ -1,0 +1,24 @@
+# mac-relay（中文）
+
+一个自托管的轻量任务中继。box 上的 bot 把任务放进队列，Mac 上的 worker 用本机工具（hermes、DeepSeek harness、`codex exec`）执行。结果和文件回传到 box 后，只给发起任务的那个 bot 发**一次**唤醒。
+
+* 只用 Python 3 标准库。数据存在 SQLite 里。同一个任务 id 重复入队不会重复执行；每个任务只保留第一个结果，失败任务只上报一次 `failed`。
+* 全部用长轮询，不用定时器、心跳或 cron。
+* 鉴权用 Bearer 共享密钥，密钥从 `RELAY_SECRET_FILE` 指向的文件读取，不会写进日志。
+
+## 服务器安装（systemd + Caddy）
+参考 README.md 的 “Server install”。服务监听 `127.0.0.1:18790`。把 `deploy/Caddyfile.snippet`（`handle_path /relay/*`）贴进站点块，先 `caddy validate`，再 reload。部署前按 `deploy/CHECKLIST.md` 删掉旧的 `yobiru-selfhost-relay` 块。
+
+## box 端
+* `bin/relay-send <slug> <hermes|deepseek|codex> '<prompt>' [--file f]`：入队后马上返回任务 id。
+* `bin/relay-box-agent`：常驻进程，用一条长轮询连接等结果。拿到结果后把文件下载到 `/workspace/relay-results/<id>/`，写 `result.json`，再按 `/workspace/relay/wake/<slug>.url` 和 `.key` 给发送方的 webhook POST 一次。POST 内容只有 task_id、status、summary、sender、result_path。如果缺少某个 slug 的配置，只记一条错误日志，不会重试。
+
+## Mac 端
+复制 `mac/relay-worker.py` 和 `examples/worker.example.json`，修改其中的 URL 和工具命令模板，再用 `mac/com.example.mac-relay.worker.plist` 生成 LaunchAgent（替换 `__占位符__`）。每个任务作为独立的后台子进程运行，没有超时。工具写进 outbox 的文件会连同 stdout 一起上传。worker 重启后会补传已完成但还没确认上传的结果。
+
+`fallback_url`（比如 Tailscale 地址）只在主地址连续失败 `fail_threshold` 次之后才启用。切过去以后会一直用备用地址，直到冷却期过后探测到主地址恢复，或者手动执行 `touch <state_dir>/reset-primary` 才切回，不会来回切换。重试退避是指数增长的，有上限。
+
+## 测试
+运行 `python3 tests/selftest.py`，结果写在 TESTS.md。
+
+MIT 许可证。
