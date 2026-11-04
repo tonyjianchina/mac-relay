@@ -12,7 +12,7 @@ Duration = task enqueue → `result.json` written on box.
 | 2 | codex long (`sleep 330`) | PASS | 368 s | No timeout. `summary.txt` came back. |
 | 3 | multimodal (PNG in, PNG + .md out) | PASS | 94 s | Codex described the 64×32 red/blue input correctly. `out.png` and `report.md` came back to the box. |
 | 4 | 4 concurrent codex tasks | PASS | 25/30/33/36 s; all done 36 s after the first was sent | They ran in parallel. Sending took about 1.5 s per task. |
-| 5 | routing jarvis / shejiao | PASS | 13 s / 22 s | Each wake got `http 200` exactly once, and each went to its own URL (the two URL files differ). |
+| 5 | routing bot-a / bot-b | PASS | 13 s / 22 s | Each wake got `http 200` exactly once, and each went to its own URL (the two URL files differ). |
 | 6a | Mac offline (worker booted out 75 s) | PASS | ~62 s (waited for worker) | Task was queued, picked up after bootstrap, delivered once. |
 | 6b | box agent killed mid-task (75 s) | PASS | ~79 s | Result waited on the relay and was delivered once after restart (1 `delivered` line). |
 | 6c | server `systemctl restart mac-relay` mid-task | PASS | ~71 s | Task finished and uploaded once. |
@@ -31,7 +31,7 @@ Duration = task enqueue → `result.json` written on box.
 - In the first 6e attempt, the test harness's `ssh` swallowed the heredoc stdin and ended the script early. That was a harness problem, not a system one; the re-run used `ssh -n` / `</dev/null`.
 
 ## Bot turns triggered
-2 wakes (jarvis 1, shejiao 1), so about 2 bot turns. No other wakes were sent.
+2 wakes (bot-a 1, bot-b 1), so about 2 bot turns. No other wakes were sent.
 
 ## Final state
 worker.json is identical to the original. The worker is running under launchd, the box agent is running, server `mac-relay` is active, and the site returns 200.
