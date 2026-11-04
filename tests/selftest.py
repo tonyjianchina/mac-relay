@@ -8,7 +8,7 @@ LONG = 8 if QUICK else 60
 T = tempfile.mkdtemp(prefix="mac-relay-test-")
 def port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
-PORT, DEAD, HOOK = port(), port(), port()
+PORT, DEAD, HOOK, FLAKY = port(), port(), port(), port()
 URL = f"http://127.0.0.1:{PORT}"
 SECRET = os.path.join(T, "secret"); open(SECRET, "w").write(os.urandom(24).hex())
 WAKES = []  # (slug, body, auth)
@@ -27,13 +27,33 @@ RES = os.path.join(T, "results")
 ENV = dict(os.environ, RELAY_URL=URL, RELAY_SECRET_FILE=SECRET, RELAY_DATA_DIR=os.path.join(T, "data"),
            RELAY_PORT=str(PORT), RELAY_CLAIM_TTL="5", RELAY_RESULTS_DIR=RES, RELAY_WAKE_DIR=WAKE)
 stub = [sys.executable, os.path.join(ROOT, "tests/stub_tool.py")]
-def wcfg(primary, name):
+import urllib.request, urllib.error
+BROKEN = {"on": True}  # FLAKY = primary that answers 503 (like Caddy with a dead upstream) until healed
+class Flaky(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def _go(self):
+        n = int(self.headers.get("Content-Length") or 0); body = self.rfile.read(n) if n else None
+        if BROKEN["on"]:
+            self.send_response(503); self.send_header("Content-Length", "0"); self.end_headers(); return
+        r = urllib.request.Request(URL + self.path, data=body, method=self.command,
+                                   headers={k: v for k, v in self.headers.items() if k.lower() not in ("host", "connection")})
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r, timeout=70) as x: st, d, ct = x.status, x.read(), x.headers.get("Content-Type")
+        except urllib.error.HTTPError as e: st, d, ct = e.code, e.read(), e.headers.get("Content-Type")
+        self.send_response(st); self.send_header("Content-Length", str(len(d)))
+        if ct: self.send_header("Content-Type", ct)
+        self.end_headers(); self.wfile.write(d)
+    do_GET = do_POST = _go
+    def log_message(self, *a): pass
+threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", FLAKY), Flaky).serve_forever, daemon=True).start()
+def wcfg(primary, name, **kw):
     p = os.path.join(T, name)
     json.dump({"primary_url": primary, "fallback_url": URL, "secret_file": SECRET, "state_dir": os.path.join(T, "mac-state"),
                "worker_name": "mac", "fail_threshold": 2, "cooldown_s": 3600, "max_backoff_s": 4,
-               "tools": {t: stub + [t, "{prompt}"] for t in ("hermes", "deepseek", "codex")}}, open(p, "w"))
+               "tools": {t: stub + [t, "{prompt}"] for t in ("hermes", "deepseek", "codex")}, **kw}, open(p, "w"))
     return p
 CFG_OK, CFG_FB = wcfg(URL, "worker.json"), wcfg(f"http://127.0.0.1:{DEAD}", "worker-fb.json")
+CFG_503 = wcfg(f"http://127.0.0.1:{FLAKY}", "worker-503.json", cooldown_s=4, fallback_source_ip="127.0.0.1")
 P = {}
 def spawn(name, cmd):
     P[name] = subprocess.Popen(cmd, env=ENV, stdout=open(f"{T}/{name}.log", "a"), stderr=subprocess.STDOUT, start_new_session=True)
@@ -147,6 +167,20 @@ def _():
     tid2 = send("beta", "hermes", "still fallback"); wait_result(tid2, 20); one_wake(tid2, "beta")
     st2 = json.load(open(os.path.join(T, "mac-state/conn.json"))); assert st2 == st, "flip-flopped"
     return "switched after 2 primary failures, stayed on fallback"
+
+@test("primary 503 -> fallback, one delivery, then sticky switch back")
+def _():
+    cf = os.path.join(T, "mac-state/conn.json")
+    kill("worker"); os.path.exists(cf) and os.remove(cf); BROKEN["on"] = True
+    worker(CFG_503); tid = send("alpha", "hermes", "primary says 503"); wait_result(tid, 40); time.sleep(2); one_wake(tid, "alpha")
+    st = json.load(open(cf)); assert st["mode"] == "fallback", st
+    time.sleep(5); st2 = json.load(open(cf)); assert st2 == st, "probed a still-503 primary and flipped"
+    BROKEN["on"] = False; end = time.time() + 70
+    while time.time() < end and json.load(open(cf))["mode"] != "primary": time.sleep(0.5)
+    assert json.load(open(cf))["mode"] == "primary", "did not switch back after primary healed"
+    tid2 = send("alpha", "hermes", "back on primary"); wait_result(tid2, 40); time.sleep(2); one_wake(tid2, "alpha")
+    log = open(f"{T}/worker.log").read(); assert log.count("connection -> fallback") >= 1
+    return "503 x2 -> fallback; stayed while 503; healed -> primary; 1 wake each"
 
 for n in list(P): kill(n)
 total = len({w[1]["task_id"] for w in WAKES}); dup = len(WAKES) - total

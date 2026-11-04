@@ -15,6 +15,21 @@ SECRET = open(os.path.expanduser(CFG["secret_file"]), "rb").read().strip().decod
 WORKER = CFG.get("worker_name", "mac")
 PROCS = {}
 
+class _SrcHTTPHandler(urllib.request.HTTPHandler):
+    """Bind the fallback socket to a local source IP (e.g. the Mac's Tailscale IP) so macOS scoped
+    routing sends it out the Tailscale utun even if another 100.64/10 route (en0/VPN) shadows it."""
+    def __init__(self, src): super().__init__(); self.src = src
+    def http_open(self, r):
+        import http.client
+        return self.do_open(lambda host, **kw: http.client.HTTPConnection(host, source_address=(self.src, 0), **kw), r)
+
+def _fallback_opener():
+    hs = [urllib.request.ProxyHandler({})]  # fallback is a tailnet address: never via system/env proxy
+    if CFG.get("fallback_source_ip"): hs.append(_SrcHTTPHandler(CFG["fallback_source_ip"]))
+    return urllib.request.build_opener(*hs)
+FALLBACK_OPENER = _fallback_opener()
+PRIMARY_OPENER = urllib.request.build_opener()
+
 def multipart(fields, files):
     b = uuid.uuid4().hex; out = []
     for k, v in fields.items():
@@ -48,10 +63,11 @@ class Conn:
                     and time.time() - self.last_probe >= CFG.get("cooldown_s", 300):
                 self.last_probe = time.time()
                 try:
-                    urllib.request.urlopen(CFG["primary_url"].rstrip("/") + "/health", timeout=5).read(); self.set("primary")
+                    PRIMARY_OPENER.open(CFG["primary_url"].rstrip("/") + "/health", timeout=5).read(); self.set("primary")
                 except Exception:
                     log("primary still down; staying on fallback")
-            return CFG["fallback_url"] if self.mode == "fallback" else CFG["primary_url"]
+            if self.mode == "fallback": return CFG["fallback_url"], FALLBACK_OPENER
+            return CFG["primary_url"], PRIMARY_OPENER
     def failed(self):
         with self.lock:
             if self.mode == "primary":
@@ -66,14 +82,16 @@ CONN = Conn()
 signal.signal(signal.SIGHUP, lambda *a: CONN.set("primary"))
 
 def req(method, path, body=None, ctype=None, timeout=70):
-    r = urllib.request.Request(CONN.base().rstrip("/") + path, data=body, method=method)
+    base, opener = CONN.base()
+    r = urllib.request.Request(base.rstrip("/") + path, data=body, method=method)
     r.add_header("Authorization", "Bearer " + SECRET)
     if ctype: r.add_header("Content-Type", ctype)
     try:
-        with urllib.request.urlopen(r, timeout=timeout) as resp:
+        with opener.open(r, timeout=timeout) as resp:
             data = resp.read(); CONN.ok(); return resp.status, data
     except urllib.error.HTTPError as e:
-        CONN.ok(); raise
+        # 5xx (502/503/504 from Caddy/CDN) = channel broken -> counts toward failover; 4xx = app-level answer
+        CONN.failed() if e.code >= 500 else CONN.ok(); raise
     except Exception:
         CONN.failed(); raise
 

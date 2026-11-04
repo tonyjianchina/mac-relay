@@ -8,8 +8,28 @@
   "cooldown_s": 300,
   "max_backoff_s": 60,
   "tools": {
-    "hermes":   ["/path/to/hermes", "run", "--prompt-file", "{prompt_file}", "--out", "{outbox}"],
-    "deepseek": ["/path/to/deepseek-harness", "--prompt-file", "{prompt_file}", "--inbox", "{inbox}"],
-    "codex":    ["codex", "exec", "-m", "gpt-6.1-sol", "{prompt}"]
-  }
+    "hermes": [
+      "/path/to/hermes",
+      "run",
+      "--prompt-file",
+      "{prompt_file}",
+      "--out",
+      "{outbox}"
+    ],
+    "deepseek": [
+      "/path/to/deepseek-harness",
+      "--prompt-file",
+      "{prompt_file}",
+      "--inbox",
+      "{inbox}"
+    ],
+    "codex": [
+      "codex",
+      "exec",
+      "-m",
+      "gpt-6.1-sol",
+      "{prompt}"
+    ]
+  },
+  "fallback_source_ip": "100.x.y.z (this Mac's Tailscale IP; optional)"
 }
