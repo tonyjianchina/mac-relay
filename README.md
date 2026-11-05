@@ -52,6 +52,8 @@ bin/relay-send <slug> codex 'summarise this' --file notes.md   # prints the task
 ```
 For each task, the agent writes `/workspace/relay-results/<id>/{result.json, files…}` and sends one POST to the sender's webhook. The POST carries `Authorization: Bearer <key>` and the body `{task_id, status, summary, sender, result_path}`. If a slug has no `.url`/`.key` file, the agent logs one error and does not retry. Wakes are at-most-once: a marker is written before the POST.
 
+**Box fallback:** set `RELAY_FALLBACK_URL` (for example `http://100.x.y.z:18791`, a Tailscale address of the relay host). `relay-box-agent` uses the same policy as the worker: it switches after `RELAY_FAIL_THRESHOLD` (default 3) consecutive primary failures (connection error or HTTP 5xx), stays on the fallback, and probes the primary `/health` once per `RELAY_COOLDOWN_S` (default 300) before switching back. Fallback requests bypass any proxy. The log shows `connection -> fallback` / `connection -> primary`. `relay-send` also retries once on `RELAY_FALLBACK_URL` if the primary fails (enqueue is idempotent by task id). Restart the agent after changing the env.
+
 ## Mac install
 ```sh
 mkdir -p ~/.config/mac-relay ~/Library/Logs/mac-relay

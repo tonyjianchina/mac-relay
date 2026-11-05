@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """relay-send <sender-slug> <hermes|deepseek|codex> '<prompt>' [--file F]... [--id ID]
-Enqueues a task and prints the task id immediately. Env: RELAY_URL, RELAY_SECRET_FILE."""
+Enqueues a task and prints the task id immediately. Env: RELAY_URL, RELAY_SECRET_FILE, optional RELAY_FALLBACK_URL (used once if the primary fails)."""
 import argparse, os, sys, time, uuid
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
-from relay.client import multipart, request, secret
+from relay.client import Failover, multipart, secret
 
 ap = argparse.ArgumentParser()
 ap.add_argument("slug"); ap.add_argument("tool", choices=["hermes", "deepseek", "codex"]); ap.add_argument("prompt")
@@ -12,7 +12,12 @@ a = ap.parse_args()
 tid = a.id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
 body, ct = multipart({"id": tid, "sender": a.slug, "tool": a.tool, "prompt": a.prompt}, a.file)
 try:
-    st, _ = request(os.environ["RELAY_URL"], secret(), "POST", "/tasks", body, ct, timeout=60)
+    conn = Failover.from_env(lambda *m: print("relay-send:", *m, file=sys.stderr)); conn.threshold = 1
+    try:
+        st, _ = conn.request(secret(), "POST", "/tasks", body, ct, timeout=60)
+    except Exception:
+        if conn.mode != "fallback": raise
+        st, _ = conn.request(secret(), "POST", "/tasks", body, ct, timeout=60)  # idempotent by task id
 except Exception as e:
     sys.exit(f"relay-send: enqueue failed: {e}")
 print(tid)

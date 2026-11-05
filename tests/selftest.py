@@ -61,7 +61,10 @@ def kill(name):
     P[name].send_signal(signal.SIGKILL); P[name].wait()
 def server(): spawn("server", [sys.executable, f"{ROOT}/relay/server.py"]); time.sleep(0.6)
 def worker(cfg=CFG_OK): spawn("worker", [sys.executable, f"{ROOT}/mac/relay-worker.py", cfg])
-def agent(): spawn("agent", [sys.executable, f"{ROOT}/bin/relay-box-agent"])
+def agent(**env):
+    spawn("agent", [sys.executable, f"{ROOT}/bin/relay-box-agent"])
+    if env: P["agent"].kill(); P["agent"].wait(); P["agent"] = subprocess.Popen([sys.executable, f"{ROOT}/bin/relay-box-agent"],
+        env=dict(ENV, **env), stdout=open(f"{T}/agent.log", "a"), stderr=subprocess.STDOUT, start_new_session=True)
 def send(slug, tool, prompt, *files, tid=None):
     cmd = [f"{ROOT}/bin/relay-send", slug, tool, prompt] + sum([["--file", f] for f in files], []) + (["--id", tid] if tid else [])
     t0 = time.time(); out = subprocess.run(cmd, env=ENV, capture_output=True, text=True, check=True).stdout.strip()
@@ -181,6 +184,29 @@ def _():
     tid2 = send("alpha", "hermes", "back on primary"); wait_result(tid2, 40); time.sleep(2); one_wake(tid2, "alpha")
     log = open(f"{T}/worker.log").read(); assert log.count("connection -> fallback") >= 1
     return "503 x2 -> fallback; stayed while 503; healed -> primary; 1 wake each"
+
+@test("box-agent: primary 503 -> fallback, one wake, then switch back")
+def _():
+    alog = f"{T}/agent.log"; n0, p0 = open(alog).read().count("connection -> fallback"), open(alog).read().count("connection -> primary")
+    kill("agent"); BROKEN["on"] = True
+    agent(RELAY_URL=f"http://127.0.0.1:{FLAKY}", RELAY_FALLBACK_URL=URL, RELAY_FAIL_THRESHOLD="2", RELAY_COOLDOWN_S="4")
+    end = time.time() + 30
+    while time.time() < end and open(alog).read().count("connection -> fallback") == n0: time.sleep(0.3)
+    assert open(alog).read().count("connection -> fallback") == n0 + 1, "agent did not switch to fallback"
+    tid = send("alpha", "hermes", "agent on fallback"); wait_result(tid, 40); time.sleep(2); one_wake(tid, "alpha")
+    time.sleep(5); assert open(alog).read().count("connection -> primary") == p0, "flipped back while primary still 503"
+    BROKEN["on"] = False; end = time.time() + 70  # long-poll (50s) must return before the next probe
+    while time.time() < end and open(alog).read().count("connection -> primary") == p0: time.sleep(0.5)
+    assert open(alog).read().count("connection -> primary") == p0 + 1, "agent did not switch back"
+    tid2 = send("beta", "hermes", "agent back on primary"); wait_result(tid2, 40); time.sleep(2); one_wake(tid2, "beta")
+    assert open(alog).read().count("connection -> fallback") == n0 + 1, "flip-flopped"
+    return "2x503 -> fallback; result delivered + 1 wake; healed -> primary; 1 wake"
+
+@test("relay-send: primary down -> enqueues via RELAY_FALLBACK_URL")
+def _():
+    e = dict(ENV, RELAY_URL=f"http://127.0.0.1:{DEAD}", RELAY_FALLBACK_URL=URL)
+    tid = subprocess.run([f"{ROOT}/bin/relay-send", "beta", "hermes", "send via fallback"], env=e, capture_output=True, text=True, check=True).stdout.strip()
+    wait_result(tid, 40); time.sleep(2); one_wake(tid, "beta"); return "enqueued on fallback, 1 wake"
 
 for n in list(P): kill(n)
 total = len({w[1]["task_id"] for w in WAKES}); dup = len(WAKES) - total
