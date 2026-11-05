@@ -39,6 +39,16 @@ curl -s http://127.0.0.1:18790/health
 ```
 Paste `deploy/Caddyfile.snippet` (`handle_path /relay/*` → `127.0.0.1:18790`) into the site block. Then run `caddy validate --config /etc/caddy/Caddyfile` and `systemctl reload caddy`. See `deploy/CHECKLIST.md`.
 
+## Without a VPS
+
+The install above is the primary path: a Linux VPS, systemd, and Caddy in front of a server bound to `127.0.0.1`. The three layouts below are alternatives when you do not want that VPS. They run the same `relay/server.py`. It has no TLS. Unless you set `RELAY_BIND`, it listens only on `127.0.0.1`, not on the tailnet. Nothing in the server adds a `/relay` prefix — that prefix exists only where Caddy `handle_path /relay/*` strips it. Steps, URLs, and the tradeoff against this VPS path are in [docs/no-vps.md](docs/no-vps.md) (Chinese: [docs/no-vps.zh-CN.md](docs/no-vps.zh-CN.md)).
+
+1. **Relay on the Mac.** The box and the Mac are on the same Tailscale. The box uses `RELAY_URL=http://<mac-100.x>:18790`. The Mac has to stay awake. There is no public listener if the tailnet ACL and the Mac firewall are tight.
+2. **Relay on the box.** The box runs the server and uses `RELAY_URL=http://127.0.0.1:18790`. The Mac worker uses `primary_url=http://<box-100.x>:18790`. The queue stays up when the Mac sleeps; tasks do not run until the worker is online.
+3. **Local relay plus a tunnel.** The server stays on the Mac or the box. Cloudflare Tunnel or Tailscale Funnel gives the other side an HTTPS base URL. When the tunnel targets port 18790 directly, that URL has no `/relay` suffix. The bearer secret is mandatory, because the URL is reachable past the tailnet.
+
+On a single URL, leave `RELAY_FALLBACK_URL` / `fallback_url` unset. Set them only when you really have two base URLs, for example a tunnel URL plus `http://100.x:18790`.
+
 ## Box install
 ```sh
 cp examples/box.env.example ~/.mac-relay.env   # set RELAY_URL=https://<host>/relay
