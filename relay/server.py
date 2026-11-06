@@ -8,7 +8,7 @@ from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
-TOOLS = {"hermes", "deepseek", "codex"}
+TOOLS = {"hermes", "deepseek", "codex", "schwab"}
 SAFE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_BODY = int(os.environ.get("RELAY_MAX_BODY", 512 * 1024 * 1024))
 MAX_WAIT = 55
@@ -175,7 +175,7 @@ class H(BaseHTTPRequestHandler):
             fields, files = parse_any(self.headers.get("Content-Type", ""), raw)
             tid, sender, tool = fields.get("id", ""), fields.get("sender", ""), fields.get("tool", "")
             if not SAFE.match(tid) or not SAFE.match(sender) or tool not in TOOLS or not fields.get("prompt"):
-                return self.send(400, {"error": "need id, sender, tool in hermes|deepseek|codex, prompt"})
+                return self.send(400, {"error": "need id, sender, tool in hermes|deepseek|codex|schwab, prompt"})
             with st.cond:
                 if st.row(tid):  # idempotent
                     return self.send(200, {"id": tid, "duplicate": True})

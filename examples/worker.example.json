@@ -29,6 +29,10 @@
       "-m",
       "gpt-6.1-sol",
       "{prompt}"
+    ],
+    "schwab": [
+      "/path/to/schwab-relay-run",
+      "{prompt_file}"
     ]
   },
   "fallback_source_ip": "100.x.y.z (this Mac's Tailscale IP; optional)"

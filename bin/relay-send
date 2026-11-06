@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""relay-send <sender-slug> <hermes|deepseek|codex> '<prompt>' [--file F]... [--id ID]
+"""relay-send <sender-slug> <hermes|deepseek|codex|schwab> '<prompt>' [--file F]... [--id ID]
 Enqueues a task and prints the task id immediately. Env: RELAY_URL, RELAY_SECRET_FILE, optional RELAY_FALLBACK_URL (used once if the primary fails)."""
 import argparse, os, sys, time, uuid
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 from relay.client import Failover, multipart, secret
 
 ap = argparse.ArgumentParser()
-ap.add_argument("slug"); ap.add_argument("tool", choices=["hermes", "deepseek", "codex"]); ap.add_argument("prompt")
+ap.add_argument("slug"); ap.add_argument("tool", choices=["hermes", "deepseek", "codex", "schwab"]); ap.add_argument("prompt")
 ap.add_argument("--file", action="append", default=[]); ap.add_argument("--id")
 a = ap.parse_args()
 tid = a.id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]

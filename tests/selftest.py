@@ -50,7 +50,7 @@ def wcfg(primary, name, **kw):
     p = os.path.join(T, name)
     json.dump({"primary_url": primary, "fallback_url": URL, "secret_file": SECRET, "state_dir": os.path.join(T, "mac-state"),
                "worker_name": "mac", "fail_threshold": 2, "cooldown_s": 3600, "max_backoff_s": 4,
-               "tools": {t: stub + [t, "{prompt}"] for t in ("hermes", "deepseek", "codex")}, **kw}, open(p, "w"))
+               "tools": {t: stub + [t, "{prompt}"] for t in ("hermes", "deepseek", "codex", "schwab")}, **kw}, open(p, "w"))
     return p
 CFG_OK, CFG_FB = wcfg(URL, "worker.json"), wcfg(f"http://127.0.0.1:{DEAD}", "worker-fb.json")
 CFG_503 = wcfg(f"http://127.0.0.1:{FLAKY}", "worker-503.json", cooldown_s=4, fallback_source_ip="127.0.0.1")

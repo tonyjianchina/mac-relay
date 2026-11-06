@@ -1,6 +1,6 @@
 # mac-relay（中文）
 
-一个自托管的轻量任务中继。box 上的 bot 把任务放进队列，Mac 上的 worker 用本机工具（hermes、DeepSeek harness、`codex exec`）执行。结果和文件回传到 box 后，只给发起任务的那个 bot 发**一次**唤醒。
+一个自托管的轻量任务中继。box 上的 bot 把任务放进队列，Mac 上的 worker 用本机工具（hermes、DeepSeek harness、`codex exec`、确定性 `schwab` CLI）执行。结果和文件回传到 box 后，只给发起任务的那个 bot 发**一次**唤醒。
 
 * 只用 Python 3 标准库。数据存在 SQLite 里。同一个任务 id 重复入队不会重复执行；每个任务只保留第一个结果，失败任务只上报一次 `failed`。
 * 全部用长轮询，不用定时器、心跳或 cron。
@@ -20,7 +20,7 @@
 只有一个地址时不要设 `RELAY_FALLBACK_URL` / `fallback_url`。两个基址都存在时才设，例如隧道 URL 再加 `http://100.x:18790`。
 
 ## box 端
-* `bin/relay-send <slug> <hermes|deepseek|codex> '<prompt>' [--file f]`：入队后马上返回任务 id。
+* `bin/relay-send <slug> <hermes|deepseek|codex|schwab> '<prompt>' [--file f]`：入队后马上返回任务 id。
 * `bin/relay-box-agent`：常驻进程，长轮询 `started` 与 `done`/`failed`。Mac 确认接单后先 POST 一次 `status=started`（summary 如「Mac 已接单（hermes）」，不带文件）；完成后把文件下载到 `/workspace/relay-results/<id>/`，写 `result.json`，再 POST 一次最终状态。按 `/workspace/relay/wake/<slug>.url` 和 `.key` 唤醒。body 始终是 task_id、status、summary、sender、result_path。缺配置时每个阶段各记一条错误，不重试；每阶段至多一次（`.wake-started` / `.wake`）。
 
 ## Mac 端
