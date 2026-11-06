@@ -1,11 +1,11 @@
 # mac-relay
 
-A small, self-hosted task relay. Box agents put tasks on a queue, and a Mac worker runs them with local tools (hermes, a DeepSeek harness, or `codex exec`). Results and files come back to the box, and the bot that sent the task gets exactly one wake call.
+A small, self-hosted task relay. Box agents put tasks on a queue, and a Mac worker runs them with local tools (hermes, a DeepSeek harness, or `codex exec`). Results and files come back to the box. The bot that sent the task gets a lightweight `started` wake when the Mac claims it, then one `done`/`failed` wake with files.
 
 ```
 box bot ──relay-send──▶ relay server (VPS, behind Caddy /relay/) ◀──long-poll── Mac worker
    ▲                          │                                         runs tool, uploads result
-   └──one wake◀──relay-box-agent (long-poll results, download files)
+   └──started+done wakes◀──relay-box-agent (long-poll events)
 ```
 
 * Python 3 standard library only. No other dependencies.
@@ -19,11 +19,11 @@ box bot ──relay-send──▶ relay server (VPS, behind Caddy /relay/) ◀�
 | GET | `/health` | Unauthenticated liveness check |
 | POST | `/tasks` | Enqueue (multipart or JSON): `id, sender, tool∈{hermes,deepseek,codex}, prompt`, plus file parts as attachments |
 | GET | `/tasks/next?worker=mac&wait=50` | Worker long-poll. Returns 200 with a task, or 204 |
-| POST | `/tasks/{id}/started` | Worker confirms the claim. An unconfirmed claim is redelivered after `RELAY_CLAIM_TTL` (20 s) |
+| POST | `/tasks/{id}/started` | Worker confirms the claim (queues a `started` wake). Unconfirmed claims redeliver after `RELAY_CLAIM_TTL` (20 s) |
 | POST | `/tasks/{id}/result` | Multipart `status=done|failed`, `summary`, and file parts. The first result wins |
 | GET | `/tasks/{id}` | Task status |
-| GET | `/results/next?wait=50` | Box-agent long-poll for finished, undelivered results |
-| POST | `/results/{id}/ack` | Box agent marks a result as delivered |
+| GET | `/results/next?wait=50` | Box-agent long-poll: pending `started` wakes first, then undelivered done/failed |
+| POST | `/results/{id}/ack` | Ack a delivery; body `{"event":"started"}` acks the started wake only (default acks done/failed) |
 | GET | `/files/{id}/in|out/{name}` | Download an attachment or an output file |
 
 ## Server install (Linux, systemd + Caddy)
@@ -60,7 +60,7 @@ set -a; . ~/.mac-relay.env; set +a
 nohup bin/relay-box-agent >> /workspace/relay/agent.log 2>&1 &
 bin/relay-send <slug> codex 'summarise this' --file notes.md   # prints the task id
 ```
-For each task, the agent writes `/workspace/relay-results/<id>/{result.json, files…}` and sends one POST to the sender's webhook. The POST carries `Authorization: Bearer <key>` and the body `{task_id, status, summary, sender, result_path}`. If a slug has no `.url`/`.key` file, the agent logs one error and does not retry. Wakes are at-most-once: a marker is written before the POST.
+For each task the agent sends up to two POSTs to the sender's webhook: `status=started` (summary like `Mac 已接单（hermes）`, no files), then `status=done|failed` after downloading `/workspace/relay-results/<id>/{result.json, files…}`. Body shape is always `{task_id, status, summary, sender, result_path}`. If a slug has no `.url`/`.key`, each phase logs one error and does not retry. Wakes are at-most-once per phase (`.wake-started` / `.wake` markers).
 
 **Box fallback:** set `RELAY_FALLBACK_URL` (for example `http://100.x.y.z:18791`, a Tailscale address of the relay host). `relay-box-agent` uses the same policy as the worker: it switches after `RELAY_FAIL_THRESHOLD` (default 3) consecutive primary failures (connection error or HTTP 5xx), stays on the fallback, and probes the primary `/health` once per `RELAY_COOLDOWN_S` (default 300) before switching back. Fallback requests bypass any proxy. The log shows `connection -> fallback` / `connection -> primary`. `relay-send` also retries once on `RELAY_FALLBACK_URL` if the primary fails (enqueue is idempotent by task id). Restart the agent after changing the env.
 

@@ -21,14 +21,14 @@
 
 ## box 端
 * `bin/relay-send <slug> <hermes|deepseek|codex> '<prompt>' [--file f]`：入队后马上返回任务 id。
-* `bin/relay-box-agent`：常驻进程，用一条长轮询连接等结果。拿到结果后把文件下载到 `/workspace/relay-results/<id>/`，写 `result.json`，再按 `/workspace/relay/wake/<slug>.url` 和 `.key` 给发送方的 webhook POST 一次。POST 内容只有 task_id、status、summary、sender、result_path。如果缺少某个 slug 的配置，只记一条错误日志，不会重试。
+* `bin/relay-box-agent`：常驻进程，长轮询 `started` 与 `done`/`failed`。Mac 确认接单后先 POST 一次 `status=started`（summary 如「Mac 已接单（hermes）」，不带文件）；完成后把文件下载到 `/workspace/relay-results/<id>/`，写 `result.json`，再 POST 一次最终状态。按 `/workspace/relay/wake/<slug>.url` 和 `.key` 唤醒。body 始终是 task_id、status、summary、sender、result_path。缺配置时每个阶段各记一条错误，不重试；每阶段至多一次（`.wake-started` / `.wake`）。
 
 ## Mac 端
 复制 `mac/relay-worker.py` 和 `examples/worker.example.json`，修改其中的 URL 和工具命令模板，再用 `mac/com.example.mac-relay.worker.plist` 生成 LaunchAgent（替换 `__占位符__`）。每个任务作为独立的后台子进程运行，没有超时。工具写进 outbox 的文件会连同 stdout 一起上传。worker 重启后会补传已完成但还没确认上传的结果。
 
 `fallback_url`（比如 Tailscale 地址）只在主地址连续失败 `fail_threshold` 次之后才启用。切过去以后会一直用备用地址，直到冷却期过后探测到主地址恢复，或者手动执行 `touch <state_dir>/reset-primary` 才切回，不会来回切换。重试退避是指数增长的，有上限。
 
-盒子端同理：在 box env 里设 `RELAY_FALLBACK_URL`（比如中转服务器的 Tailscale 地址 `http://100.x.y.z:18791`），`relay-box-agent` 在主地址连续 `RELAY_FAIL_THRESHOLD`（默认 3）次失败（连接错误或 HTTP 5xx）后切到备用，每 `RELAY_COOLDOWN_S`（默认 300）秒最多探一次主地址 `/health`，恢复才切回。备用请求不走代理。日志里会有 `connection -> fallback` / `connection -> primary`。`relay-send` 在主地址失败时也会用 `RELAY_FALLBACK_URL` 重试一次（按 task id 幂等）。改了 env 要重启 box-agent。每条结果仍然只唤醒一次。
+盒子端同理：在 box env 里设 `RELAY_FALLBACK_URL`（比如中转服务器的 Tailscale 地址 `http://100.x.y.z:18791`），`relay-box-agent` 在主地址连续 `RELAY_FAIL_THRESHOLD`（默认 3）次失败（连接错误或 HTTP 5xx）后切到备用，每 `RELAY_COOLDOWN_S`（默认 300）秒最多探一次主地址 `/health`，恢复才切回。备用请求不走代理。日志里会有 `connection -> fallback` / `connection -> primary`。`relay-send` 在主地址失败时也会用 `RELAY_FALLBACK_URL` 重试一次（按 task id 幂等）。改了 env 要重启 box-agent。每条任务最多唤醒两次（started + 最终状态）。
 
 ## 测试
 运行 `python3 tests/selftest.py`，结果写在 TESTS.md。

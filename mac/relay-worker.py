@@ -145,7 +145,8 @@ def sweep():
         if os.path.exists(os.path.join(d, "uploaded")) or not os.path.exists(os.path.join(d, "pid")):
             continue
         if tid in PROCS: PROCS[tid].poll()
-        if not os.path.exists(os.path.join(d, "confirmed")) and not os.path.exists(os.path.join(d, "exitcode")):
+        # Confirm start even after the tool exits (first confirm may have failed mid-failover).
+        if not os.path.exists(os.path.join(d, "confirmed")):
             confirm(tid)
         ec_f = os.path.join(d, "exitcode")
         if os.path.exists(ec_f):

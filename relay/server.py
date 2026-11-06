@@ -31,6 +31,10 @@ class Store:
             id text primary key, sender text, tool text, prompt text, attachments text,
             state text, worker text, created real, started real, finished real,
             status text, summary text, files text, delivered integer default 0)""")
+        # started_wake: NULL=never confirmed start; 0=pending started wake; 1=started wake sent
+        cols = {r[1] for r in self.db.execute("pragma table_info(tasks)")}
+        if "started_wake" not in cols:
+            self.db.execute("alter table tasks add column started_wake integer")
         self.db.commit()
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -63,9 +67,16 @@ class Store:
                     return None
                 self.cond.wait(min(left, 2))
 
-def task_view(d):
-    return {k: d[k] for k in ("id", "sender", "tool", "prompt", "state", "status", "summary", "created", "finished")} | {
+def task_view(d, event=None):
+    """event='started' synthesizes the lightweight started wake payload; else normal result view."""
+    v = {k: d[k] for k in ("id", "sender", "tool", "prompt", "state", "status", "summary", "created", "finished")} | {
         "attachments": json.loads(d["attachments"] or "[]"), "files": json.loads(d["files"] or "[]")}
+    if event == "started":
+        v["status"] = "started"
+        v["summary"] = f"Mac 已接单（{d['tool']}）"
+        v["files"] = []
+        v["finished"] = None
+    return v
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -125,9 +136,17 @@ class H(BaseHTTPRequestHandler):
                                lambda d: (worker, time.time(), d["id"])), wait, self.peer_alive)
             return self.send(200, {"task": task_view(d)}) if d else self.send(204, raw=b"")
         if parts == ["results", "next"]:
-            d = st.wait_claim("select * from tasks where state in ('done','failed') and delivered=0 order by finished limit 1",
-                              (), None, wait, self.peer_alive)
-            return self.send(200, {"task": task_view(d)}) if d else self.send(204, raw=b"")
+            # One wait: pending started wakes first, then undone done/failed deliveries.
+            d = st.wait_claim(
+                "select * from tasks where started_wake=0 or "
+                "(state in ('done','failed') and delivered=0) "
+                "order by case when started_wake=0 then 0 else 1 end, "
+                "coalesce(started, finished, created) limit 1",
+                (), None, wait, self.peer_alive)
+            if not d:
+                return self.send(204, raw=b"")
+            ev = "started" if d.get("started_wake") == 0 else None
+            return self.send(200, {"task": task_view(d, event=ev)})
         if len(parts) == 2 and parts[0] == "tasks":
             with st.lock:
                 d = st.row(parts[1])
@@ -200,11 +219,23 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"id": tid})
         if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "started":
             with st.cond:
-                st.db.execute("update tasks set state='running' where id=? and state='claimed'", (parts[1],)); st.db.commit()
+                # Mark started_wake=0 only once (NULL -> 0). Already-running/done tasks stay idempotent.
+                st.db.execute("update tasks set state='running', started_wake=COALESCE(started_wake, 0) "
+                              "where id=? and state in ('claimed','running')", (parts[1],))
+                st.db.commit(); st.cond.notify_all()
             return self.send(200, {"id": parts[1]})
         if len(parts) == 3 and parts[0] == "results" and parts[2] == "ack":
+            # Optional {"event":"started"} acks the started wake only; default/empty acks done/failed (compat).
+            try:
+                ev = (json.loads(raw or b"{}") or {}).get("event") if raw else None
+            except Exception:
+                ev = None
             with st.cond:
-                st.db.execute("update tasks set delivered=1 where id=?", (parts[1],)); st.db.commit()
+                if ev == "started":
+                    st.db.execute("update tasks set started_wake=1 where id=? and started_wake=0", (parts[1],))
+                else:
+                    st.db.execute("update tasks set delivered=1 where id=?", (parts[1],))
+                st.db.commit()
             return self.send(200, {"id": parts[1]})
         self.send(404, {"error": "no route"})
 
