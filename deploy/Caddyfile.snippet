@@ -1,6 +1,9 @@
 # Paste INSIDE the existing site block of /etc/caddy/Caddyfile.
 # BEGIN mac-relay
 handle_path /relay/* {
+	# 512MB matches RELAY_MAX_BODY (streaming PUT and JSON). Multipart is still
+	# rejected by the app above RELAY_MAX_SOFT_BODY (default 16MiB): relay-send
+	# attachments, and any multipart result from an old worker.
 	request_body {
 		max_size 512MB
 	}

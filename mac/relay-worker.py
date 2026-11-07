@@ -2,8 +2,13 @@
 """mac-relay worker (runs on the Mac). Stdlib only, self-contained.
 Usage: relay-worker.py /path/to/worker.json
 Long-polls the relay, runs each task as a detached subprocess (no timeout), uploads
-stdout + outbox files exactly once. Unacked results are re-uploaded after restarts."""
-import json, os, signal, subprocess, sys, threading, time, uuid, urllib.request, urllib.parse
+stdout + outbox files exactly once. Unacked results are re-uploaded after restarts.
+
+Large outputs: PUT /tasks/{id}/files/{name} as octet-stream (streamed from disk), then
+POST /tasks/{id}/result as application/json. This worker always uses that path so the
+server never parses a multipart result. max_soft_file (default 16MiB) is logged only;
+it does not select a transport. Box clients still enqueue attachments as multipart."""
+import json, os, signal, subprocess, sys, threading, time, uuid, urllib.request, urllib.parse, urllib.error
 
 def log(*a):
     print(time.strftime("%Y-%m-%dT%H:%M:%S"), *a, file=sys.stderr, flush=True)
@@ -13,6 +18,7 @@ STATE = os.path.expanduser(CFG["state_dir"]); TASKS = os.path.join(STATE, "tasks
 os.makedirs(TASKS, exist_ok=True)
 SECRET = open(os.path.expanduser(CFG["secret_file"]), "rb").read().strip().decode()
 WORKER = CFG.get("worker_name", "mac")
+SOFT = int(CFG.get("max_soft_file", 16 * 1024 * 1024))
 PROCS = {}
 
 class _SrcHTTPHandler(urllib.request.HTTPHandler):
@@ -81,11 +87,13 @@ class Conn:
 CONN = Conn()
 signal.signal(signal.SIGHUP, lambda *a: CONN.set("primary"))
 
-def req(method, path, body=None, ctype=None, timeout=70):
+def req(method, path, body=None, ctype=None, timeout=70, content_length=None):
     base, opener = CONN.base()
     r = urllib.request.Request(base.rstrip("/") + path, data=body, method=method)
     r.add_header("Authorization", "Bearer " + SECRET)
     if ctype: r.add_header("Content-Type", ctype)
+    if content_length is not None:
+        r.add_header("Content-Length", str(content_length))
     try:
         with opener.open(r, timeout=timeout) as resp:
             data = resp.read(); CONN.ok(); return resp.status, data
@@ -94,6 +102,20 @@ def req(method, path, body=None, ctype=None, timeout=70):
         CONN.failed() if e.code >= 500 else CONN.ok(); raise
     except Exception:
         CONN.failed(); raise
+
+def put_file(tid, path, kind="out"):
+    """Stream a file to PUT /tasks/{tid}/files/{name} without loading it into RAM."""
+    name = os.path.basename(path)
+    size = os.path.getsize(path)
+    q = urllib.parse.quote(tid), urllib.parse.quote(name)
+    with open(path, "rb") as f:
+        st, _ = req("PUT", f"/tasks/{q[0]}/files/{q[1]}?kind={kind}", f,
+                    "application/octet-stream", timeout=max(300, size // (256 * 1024) + 60),
+                    content_length=size)
+    if st not in (200, 201):
+        raise RuntimeError(f"put {name} -> HTTP {st}")
+    log("put-file", tid, kind, name, size)
+    return name
 
 def start(task):
     tid = task["id"]; d = os.path.join(TASKS, tid)
@@ -138,6 +160,14 @@ def last_line(path):
     except OSError: return ""
     return lines[-1][:240] if lines else ""
 
+def upload_result(tid, status, summary, files):
+    """PUT each file, then POST a JSON result. Always this path (no multipart result)."""
+    names = []
+    for path in files:
+        names.append(put_file(tid, path, kind="out"))
+    body = json.dumps({"status": status, "summary": summary, "files": names}).encode()
+    req("POST", f"/tasks/{urllib.parse.quote(tid)}/result", body, "application/json", timeout=60)
+
 def sweep():
     """Upload every finished-but-unacked task. Also detects processes lost across reboots."""
     for tid in os.listdir(TASKS):
@@ -165,13 +195,12 @@ def sweep():
                  if os.path.exists(os.path.join(d, n)) and os.path.getsize(os.path.join(d, n))]
         out = os.path.join(d, "out")
         files += sorted(os.path.join(out, n) for n in os.listdir(out) if os.path.isfile(os.path.join(out, n)))
-        body, ct = multipart({"status": status, "summary": summary}, files)
         try:
-            req("POST", f"/tasks/{urllib.parse.quote(tid)}/result", body, ct, timeout=300)
+            upload_result(tid, status, summary, files)
         except Exception as e:
-            log("upload pending", tid, type(e).__name__); return False
+            log("upload pending", tid, type(e).__name__, str(e)[:120]); return False
         open(os.path.join(d, "uploaded"), "w").write(status); PROCS.pop(tid, None)
-        log("uploaded", tid, status)
+        log("uploaded", tid, status, len(files), "files")
     return True
 
 def poll_loop():
@@ -193,7 +222,7 @@ def poll_loop():
             backoff = min(backoff * 2, CFG.get("max_backoff_s", 60))
 
 def main():
-    log("worker", WORKER, "state", STATE)
+    log("worker", WORKER, "state", STATE, "soft_file", SOFT)
     threading.Thread(target=poll_loop, daemon=True).start()
     backoff = 1
     while True:  # local-only scan of task dirs; network only when something finished

@@ -28,6 +28,8 @@ Tradeoffs against the VPS path are in each section below.
 | `RELAY_DATA_DIR` | no | `./data` | SQLite database and task files. Relative paths follow the process working directory |
 | `RELAY_BIND` | no | `127.0.0.1` | listen address |
 | `RELAY_PORT` | no | `18790` | listen port |
+| `RELAY_MAX_SOFT_BODY` | no | `16777216` (16MiB) | multipart cap. A larger `Content-Length` returns 413 and the server closes the connection without reading the body |
+| `RELAY_MAX_BODY` | no | `536870912` (512MiB) | hard cap for every other body, including streaming PUT |
 
 The shipped unit `deploy/mac-relay.service` sets `RELAY_BIND=127.0.0.1` on purpose, so that only a local reverse proxy can reach it. The default is not a tailnet listener. If a Tailscale peer or any other machine must connect to this process, set `RELAY_BIND=0.0.0.0` or to that interface’s address before you start it. Check from the *other* machine. `curl` to `127.0.0.1` succeeds for both `127.0.0.1` and `0.0.0.0`, so it does not prove the bind changed.
 
@@ -36,6 +38,22 @@ The shipped unit `deploy/mac-relay.service` sets `RELAY_BIND=127.0.0.1` on purpo
 The server does not speak TLS. `https://` in a client URL works only when something else terminates TLS and forwards HTTP to this process (Caddy on the VPS path, or a tunnel in layout 3).
 
 The server does not read `RELAY_URL`. That variable is only for the box tools.
+
+### Large outputs and the multipart cap
+
+`RELAY_MAX_SOFT_BODY` applies only to `multipart/*`. `RELAY_MAX_BODY` is the hard cap for a streaming PUT and for a JSON body. `GET /health` reports both as `soft_body` and `max_body`. With the defaults, the body is `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`.
+
+Worker outputs are `PUT /tasks/{id}/files/{name}?kind=out` with `Content-Type: application/octet-stream` and `Content-Length` set to the file size. The server writes that stream to disk in 1MiB chunks (a `.partial` file, then `rename`). The worker then POSTs `/tasks/{id}/result` as JSON:
+
+```json
+{"status": "done", "summary": "last stdout line", "files": ["stdout.txt", "notes.txt"]}
+```
+
+`status` is `done` or `failed`. `files` lists names already in that task's `out` directory. A missing name is left out. The first result still wins. `GET /files/{id}/in|out/{name}` answers with `Content-Length` and 1MiB reads, so a download is not one buffer. `max_soft_file` in `worker.json` is logged at startup and does not switch the worker back to multipart.
+
+**Task input attachments sent by the box client (`bin/relay-send --file`) still go as multipart and are still capped at 16MiB.** `relay-send` does not call PUT. Layouts on this page do not gain two-way large-file transfer. Only worker outputs use streaming PUT.
+
+Upgrade: install the new `relay/server.py` and `mac/relay-worker.py`, then restart both. An old worker can still post a multipart result of at most 16MiB. Anything larger gets 413 and a closed connection until that worker is replaced. No new env var is required for the defaults.
 
 ### Secret
 
@@ -73,7 +91,7 @@ A real run recorded in [TESTS-REAL.md](../TESTS-REAL.md) failed when a Mac syste
 
 ### Smoke test
 
-`GET /health` is unauthenticated and returns `{"ok": true}`. Every other route without the bearer returns 401. An open `/health` does not open the queue.
+`GET /health` is unauthenticated and, at the default limits, returns `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`. `soft_body` and `max_body` are `RELAY_MAX_SOFT_BODY` and `RELAY_MAX_BODY`. Every other route without the bearer returns 401. An open `/health` does not open the queue.
 
 ```sh
 curl -sS "http://127.0.0.1:18790/health"          # on the server machine
@@ -83,7 +101,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 
 Replace the origin with the base URL that client actually uses. You want the JSON body, not an HTML 404 from a proxy.
 
-The box agent and the worker are otherwise unchanged. Wake files, tool argv templates, and the LaunchAgent for `mac/relay-worker.py` are in the README. Tool templates stay in `examples/worker.example.json`.
+Wake files, tool argv templates, and the LaunchAgent for `mac/relay-worker.py` are in the README. Tool templates stay in `examples/worker.example.json`. Copy the current `mac/relay-worker.py` when you upgrade: it uploads outputs with PUT, then a JSON result.
 
 ## 1. Relay on the Mac, box over Tailscale
 
@@ -132,14 +150,14 @@ export RELAY_PORT=18790
 /usr/bin/python3 /path/to/mac-relay/relay/server.py
 ```
 
-Stderr should include `mac-relay listening on 0.0.0.0 18790`. On the Mac:
+Stderr should include `mac-relay listening on 0.0.0.0 18790 soft_body 16777216`. On the Mac:
 
 ```sh
 curl -sS http://127.0.0.1:18790/health
 curl -sS "http://$(tailscale ip -4):18790/health"
 ```
 
-Both must print `{"ok": true}`. If only localhost works, the process is still bound to `127.0.0.1`.
+Both must print `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`. If only localhost works, the process is still bound to `127.0.0.1`.
 
 Then a LaunchAgent, separate from the worker agent. launchd does not expand `~` or `$HOME`. Replace `YOU` and the clone path.
 
@@ -211,6 +229,7 @@ Restart the agent after any env change. `RELAY_BIND` does not belong in this fil
   "secret_file": "~/.config/mac-relay/secret",
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
+  "max_soft_file": 16777216,
   "fail_threshold": 3,
   "cooldown_s": 300,
   "max_backoff_s": 60,
@@ -222,7 +241,7 @@ Restart the agent after any env change. `RELAY_BIND` does not belong in this fil
 }
 ```
 
-Leave `fallback_url` and `fallback_source_ip` out. The `tools` values are the placeholders from `examples/worker.example.json`; replace them with the commands you actually run. `secret_file` and `state_dir` expand `~`. The server LaunchAgent environment does not.
+Leave `fallback_url` and `fallback_source_ip` out. `max_soft_file` is optional and only logged; the worker still uploads with PUT. The `tools` values are the placeholders from `examples/worker.example.json`; replace them with the commands you actually run. `secret_file` and `state_dir` expand `~`. The server LaunchAgent environment does not.
 
 The other legal `primary_url` is `http://100.x.y.z:18790` (this Mac’s Tailscale address). It has to survive the system proxy. `127.0.0.1` is the one to use unless that is unsuitable.
 
@@ -238,7 +257,7 @@ Compared with the VPS path: there is no second machine, no Caddy, and no public 
 
 ### Smoke
 
-On the Mac, both curls in “Run the server” return `{"ok": true}`.
+On the Mac, both curls in “Run the server” return `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`.
 
 On the box, with the tailnet up:
 
@@ -247,7 +266,7 @@ curl -sS --max-time 5 http://100.x.y.z:18790/health
 curl -sS -o /dev/null -w '%{http_code}\n' --max-time 5 http://100.x.y.z:18790/tasks/next
 ```
 
-Expect `{"ok": true}` and `401`. Connection refused means nothing is listening on that address (bind still localhost, or the server is stopped). A timeout means routing, ACL, firewall, or the Mac is asleep. Then `bin/relay-send <slug> codex 'ping'` should print a task id, and the worker log should show it starting.
+Expect `{"ok": true, "soft_body": 16777216, "max_body": 536870912}` and `401`. Connection refused means nothing is listening on that address (bind still localhost, or the server is stopped). A timeout means routing, ACL, firewall, or the Mac is asleep. Then `bin/relay-send <slug> codex 'ping'` should print a task id, and the worker log should show it starting.
 
 ## 2. Relay on the box, Mac over Tailscale
 
@@ -306,7 +325,7 @@ Either way, on the box:
 curl -sS http://127.0.0.1:18790/health
 ```
 
-That must print `{"ok": true}`. It does not prove the bind. From the Mac, `curl -sS --max-time 5 http://<box-100.x>:18790/health` does. Read `<box-100.x>` with `tailscale ip -4` on the box.
+That must print `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`. It does not prove the bind. From the Mac, `curl -sS --max-time 5 http://<box-100.x>:18790/health` does. Read `<box-100.x>` with `tailscale ip -4` on the box.
 
 ### box.env
 
@@ -331,6 +350,7 @@ Follow the README “Mac install”. `~/.config/mac-relay/worker.json`, with `to
   "secret_file": "~/.config/mac-relay/secret",
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
+  "max_soft_file": 16777216,
   "fail_threshold": 3,
   "cooldown_s": 300,
   "max_backoff_s": 60,
@@ -352,9 +372,9 @@ Compared with the VPS path: the always-on machine is the box you already have, n
 
 ### Smoke
 
-On the box: `curl -sS http://127.0.0.1:18790/health` → `{"ok": true}`.
+On the box: `curl -sS http://127.0.0.1:18790/health` → `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`.
 
-On the Mac: `curl -sS --max-time 5 http://100.x.y.z:18790/health` → `{"ok": true}`, and the same URL with path `/tasks/next` and no bearer → `401`. Then a `relay-send` from the box should be claimed by the worker.
+On the Mac: `curl -sS --max-time 5 http://100.x.y.z:18790/health` → `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`, and the same URL with path `/tasks/next` and no bearer → `401`. Then a `relay-send` from the box should be claimed by the worker.
 
 ## 3. Local relay plus a tunnel
 
@@ -377,7 +397,7 @@ Prefer localhost for whichever of the box agent or the Mac worker shares a machi
 - `cloudflared` or the Tailscale CLI, installed from that product’s docs. This repo does not ship either binary.
 - The bearer secret, as in the shared rules. A tunnel does not authenticate mac-relay. `/health` is public. Everything else needs the bearer.
 
-Point the tunnel at localhost only after `curl -sS http://127.0.0.1:18790/health` on that machine returns `{"ok": true}`.
+Point the tunnel at localhost only after `curl -sS http://127.0.0.1:18790/health` on that machine returns `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`.
 
 If the remote side will also use `http://<server-100.x>:18790` as a fallback, switch `RELAY_BIND` to `0.0.0.0` and re-check that URL from the remote machine. Funnel and `cloudflared` as documented below connect to `127.0.0.1`, so a process bound only to the Tailscale address will not receive their traffic. `0.0.0.0` covers both.
 
@@ -457,6 +477,7 @@ RELAY_COOLDOWN_S=300
   "secret_file": "~/.config/mac-relay/secret",
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
+  "max_soft_file": 16777216,
   "fail_threshold": 3,
   "cooldown_s": 300,
   "max_backoff_s": 60,
@@ -497,4 +518,4 @@ curl -sS --max-time 20 "https://<tunnel-host>/health"
 curl -sS -o /dev/null -w '%{http_code}\n' --max-time 20 "https://<tunnel-host>/tasks/next"
 ```
 
-Expect `{"ok": true}` and `401`. If `/health` is 404 HTML, the tunnel is not aimed at the server root, or a client has a `/relay` prefix the server never had. If you configured the tailnet fallback, `curl -sS --max-time 5 http://100.x.y.z:18790/health` from the remote machine must also return `{"ok": true}` before you set `RELAY_FALLBACK_URL` / `fallback_url`. Then `relay-send` through `RELAY_URL`.
+Expect `{"ok": true, "soft_body": 16777216, "max_body": 536870912}` and `401`. If `/health` is 404 HTML, the tunnel is not aimed at the server root, or a client has a `/relay` prefix the server never had. If you configured the tailnet fallback, `curl -sS --max-time 5 http://100.x.y.z:18790/health` from the remote machine must also return `{"ok": true, "soft_body": 16777216, "max_body": 536870912}` before you set `RELAY_FALLBACK_URL` / `fallback_url`. Then `relay-send` through `RELAY_URL`.

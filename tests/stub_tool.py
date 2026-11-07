@@ -16,4 +16,12 @@ open("image.png", "wb").write(png())
 open("notes.txt", "w").write(f"tool={tool}\nprompt={prompt}\ninbox={sorted(os.listdir(os.environ['RELAY_INBOX']))}\n")
 if "media" in prompt:
     open("clip.mp4", "wb").write(b"\x00\x00\x00\x18ftypmp42" + os.urandom(200_000))
+if "big" in prompt:
+    # Over the server's default multipart soft cap (16MiB). The worker must PUT this.
+    n, block = 16 * 1024 * 1024 + 4096, b"relay-big-block\n" * 256
+    with open("big.bin", "wb") as f:
+        left = n
+        while left:
+            c = block if left >= len(block) else block[:left]
+            f.write(c); left -= len(c)
 print(f"stub {tool} ok: {prompt[:40]}")

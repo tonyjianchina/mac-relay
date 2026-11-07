@@ -43,7 +43,9 @@ class Flaky(BaseHTTPRequestHandler):
         self.send_response(st); self.send_header("Content-Length", str(len(d)))
         if ct: self.send_header("Content-Type", ct)
         self.end_headers(); self.wfile.write(d)
-    do_GET = do_POST = _go
+    # The worker uploads with PUT. A stand-in for Caddy has to 503 or forward that method too;
+    # otherwise BaseHTTPRequestHandler answers 501 and the worker treats the channel as down.
+    do_GET = do_POST = do_PUT = _go
     def log_message(self, *a): pass
 threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", FLAKY), Flaky).serve_forever, daemon=True).start()
 def wcfg(primary, name, **kw):
@@ -89,6 +91,38 @@ def expect_wakes(tid, slug, final="done"):
     assert "Mac 已接单" in w[0][1]["summary"], w[0][1]["summary"]
 def one_wake(tid, slug):  # backward name used nowhere after rewrite; keep alias
     expect_wakes(tid, slug)
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def bearer():
+    return "Bearer " + open(SECRET).read().strip()
+def api(method, path, body=None, ctype=None, timeout=120, headers=None):
+    r = urllib.request.Request(URL + path, data=body, method=method)
+    r.add_header("Authorization", bearer())
+    if ctype: r.add_header("Content-Type", ctype)
+    for k, v in (headers or {}).items(): r.add_header(k, v)
+    try:
+        with OPENER.open(r, timeout=timeout) as resp: return resp.status, resp.read(), resp.headers
+    except urllib.error.HTTPError as e: return e.code, e.read(), e.headers
+def fill(path, n):
+    block = b"relay-big-block\n" * 256
+    with open(path, "wb") as f:
+        left = n
+        while left:
+            c = block if left >= len(block) else block[:left]
+            f.write(c); left -= len(c)
+def sha_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for c in iter(lambda: f.read(1024 * 1024), b""): h.update(c)
+    return h.hexdigest()
+def sha_get(path):
+    r = urllib.request.Request(URL + path, method="GET"); r.add_header("Authorization", bearer())
+    h, n = hashlib.sha256(), 0
+    with OPENER.open(r, timeout=120) as resp:
+        cl = int(resp.headers["Content-Length"])
+        for c in iter(lambda: resp.read(1024 * 1024), b""):
+            h.update(c); n += len(c)
+    assert n == cl, (n, cl)
+    return h.hexdigest(), n
 ROWS = []
 def test(name):
     def deco(fn):
@@ -104,6 +138,91 @@ server(); worker(); agent()
 def _():
     tid = send("alpha", "hermes", "hello"); r = wait_result(tid, 20); expect_wakes(tid, "alpha")
     assert r["status"] == "done" and "stub hermes ok" in r["summary"]; return r["summary"]
+
+@test("health reports soft_body and max_body")
+def _():
+    with OPENER.open(URL + "/health", timeout=5) as resp: h = json.loads(resp.read())
+    assert h["ok"] is True and h["soft_body"] == 16 * 1024 * 1024 and h["max_body"] == 512 * 1024 * 1024, h
+    return f"soft_body={h['soft_body']} max_body={h['max_body']}"
+
+@test("multipart over soft limit -> 413 and connection closed")
+def _():
+    with OPENER.open(URL + "/health", timeout=5) as resp: soft = json.loads(resp.read())["soft_body"]
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+    try:
+        s.sendall((
+            "POST /tasks HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: {bearer()}\r\n"
+            "Content-Type: multipart/form-data; boundary=deadbeef\r\n"
+            f"Content-Length: {soft + 1}\r\n"
+            "\r\n"
+        ).encode())  # headers only: the server must reject before reading the body
+        f = s.makefile("rb")
+        status = f.readline().decode()
+        hdrs = {}
+        while True:
+            line = f.readline()
+            if line in (b"\r\n", b"\n", b""): break
+            k, v = line.decode().split(":", 1); hdrs[k.lower()] = v.strip()
+        body = f.read(int(hdrs["content-length"]))
+        extra = f.read(1)
+    finally:
+        s.close()
+    assert "413" in status, status
+    assert hdrs.get("connection", "").lower() == "close", hdrs
+    assert extra == b"", "connection stayed open after 413"
+    err = json.loads(body)
+    assert "soft limit" in err["error"] and "PUT" in err["error"], err
+    return err["error"]
+
+@test("PUT then GET sha256, JSON result files[]")
+def _():
+    kill("worker"); kill("agent")
+    try:
+        tid = "stream-put-1"
+        st, raw, _ = api("POST", "/tasks", json.dumps({
+            "id": tid, "sender": "alpha", "tool": "hermes", "prompt": "api stream"}).encode(), "application/json")
+        assert st == 201, (st, raw)
+        path = os.path.join(T, "stream.bin")
+        n = 16 * 1024 * 1024 + 4096  # above the multipart soft cap; PUT must still accept it
+        fill(path, n); want = sha_file(path)
+        with open(path, "rb") as fh:
+            st, raw, _ = api("PUT", f"/tasks/{tid}/files/blob.bin?kind=out", fh, "application/octet-stream",
+                             headers={"Content-Length": str(n)})
+        assert st == 200 and json.loads(raw)["bytes"] == n, (st, raw)
+        got, gn = sha_get(f"/files/{tid}/out/blob.bin")
+        assert got == want and gn == n, (got, want, gn)
+        st, raw, _ = api("POST", f"/tasks/{tid}/result", json.dumps({
+            "status": "done", "summary": "streamed put", "files": ["blob.bin", "missing.bin"]}).encode(),
+                         "application/json")
+        assert st == 200, (st, raw)
+        task = json.loads(api("GET", f"/tasks/{tid}")[1])["task"]
+        assert task["status"] == "done" and task["files"] == ["blob.bin"] and task["summary"] == "streamed put", task
+        st, raw, _ = api("POST", f"/results/{tid}/ack", b"{}", "application/json")
+        assert st == 200, (st, raw)
+        return f"sha256 {got[:12]}… {n} bytes; missing name dropped"
+    finally:
+        worker(); agent()
+
+@test("worker uploads outputs via PUT")
+def _():
+    tid = send("alpha", "hermes", "big please")
+    r = wait_result(tid, 60); expect_wakes(tid, "alpha")
+    local = os.path.join(T, "mac-state", "tasks", tid, "out", "big.bin")
+    saved = os.path.join(RES, tid, "big.bin")
+    assert os.path.getsize(local) > 16 * 1024 * 1024, os.path.getsize(local)
+    want = sha_file(local)
+    assert sha_file(saved) == want
+    got, gn = sha_get(f"/files/{tid}/out/big.bin")
+    assert got == want and gn == os.path.getsize(local)
+    names = [os.path.basename(p) for p in r["files"]]
+    assert "big.bin" in names and "stdout.txt" in names, names
+    slog, wlog = open(f"{T}/server.log").read(), open(f"{T}/worker.log").read()
+    needle = f"put-file {tid} out big.bin"
+    assert needle in slog and needle in wlog, "worker result was not a streaming PUT"
+    assert f"uploaded {tid} done" in wlog
+    return f"PUT {gn} bytes sha256 matched"
 
 @test("started wake before done wake")
 def _():

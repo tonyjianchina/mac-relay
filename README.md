@@ -16,15 +16,16 @@ box bot ──relay-send──▶ relay server (VPS, behind Caddy /relay/) ◀�
 ## API
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Unauthenticated liveness check |
-| POST | `/tasks` | Enqueue (multipart or JSON): `id, sender, tool∈{hermes,deepseek,codex}, prompt`, plus file parts as attachments |
+| GET | `/health` | Unauthenticated. Default body `{"ok": true, "soft_body": 16777216, "max_body": 536870912}` |
+| POST | `/tasks` | Enqueue (multipart or JSON): `id, sender, tool∈{hermes,deepseek,codex}, prompt`, plus file parts as attachments. Multipart is capped at `RELAY_MAX_SOFT_BODY` (16MiB) |
 | GET | `/tasks/next?worker=mac&wait=50` | Worker long-poll. Returns 200 with a task, or 204 |
 | POST | `/tasks/{id}/started` | Worker confirms the claim (queues a `started` wake). Unconfirmed claims redeliver after `RELAY_CLAIM_TTL` (20 s) |
-| POST | `/tasks/{id}/result` | Multipart `status=done|failed`, `summary`, and file parts. The first result wins |
+| PUT | `/tasks/{id}/files/{name}?kind=out\|in` | Stream one file to disk (`application/octet-stream`, `Content-Length` required, up to `RELAY_MAX_BODY`). The task must already exist. Worker outputs use `kind=out` |
+| POST | `/tasks/{id}/result` | JSON `{"status":"done"\|"failed","summary":"…","files":["name.bin"]}` and/or a multipart body at or under the soft cap. `files[]` records names already stored by PUT. The first result wins |
 | GET | `/tasks/{id}` | Task status |
 | GET | `/results/next?wait=50` | Box-agent long-poll: pending `started` wakes first, then undelivered done/failed |
 | POST | `/results/{id}/ack` | Ack a delivery; body `{"event":"started"}` acks the started wake only (default acks done/failed) |
-| GET | `/files/{id}/in|out/{name}` | Download an attachment or an output file |
+| GET | `/files/{id}/in\|out/{name}` | Download an attachment or an output file, streamed in 1MiB chunks |
 
 ## Server install (Linux, systemd + Caddy)
 ```sh
@@ -38,6 +39,29 @@ sudo systemctl daemon-reload && sudo systemctl enable --now mac-relay
 curl -s http://127.0.0.1:18790/health
 ```
 Paste `deploy/Caddyfile.snippet` (`handle_path /relay/*` → `127.0.0.1:18790`) into the site block. Then run `caddy validate --config /etc/caddy/Caddyfile` and `systemctl reload caddy`. See `deploy/CHECKLIST.md`.
+
+`/health` on a default install is `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`.
+
+## File sizes
+
+Two limits, both bytes, both optional env vars on the server:
+
+| Env | Default | Applies to |
+|---|---|---|
+| `RELAY_MAX_SOFT_BODY` | 16777216 (16MiB) | `multipart/*` only. A larger `Content-Length` returns 413 with `Connection: close`. The body is not read and is not parsed |
+| `RELAY_MAX_BODY` | 536870912 (512MiB) | Every other body, including `PUT /tasks/{id}/files/{name}` |
+
+Worker outputs use the PUT path. For each stdout, stderr, and outbox file, `mac/relay-worker.py` streams the file with `PUT /tasks/{id}/files/{name}?kind=out`, then POSTs `application/json` to `/tasks/{id}/result`:
+
+```json
+{"status": "done", "summary": "last stdout line", "files": ["stdout.txt", "notes.txt"]}
+```
+
+`files` is an array of names already on disk under that task's `out` directory. A name that was not PUT is ignored. `max_soft_file` in `worker.json` (default 16MiB) is written to the worker log at startup. It does not change the upload path: the worker always uses PUT + JSON.
+
+**Task input attachments sent by the box client (`bin/relay-send --file`) still go as multipart and are still capped at 16MiB.** `relay-send` does not call PUT. This is not two-way large-file support. Only worker outputs are streamed. A box that needs to hand the Mac a larger input has to do that outside the enqueue body.
+
+Upgrade a relay that is already running: replace `relay/server.py` and `mac/relay-worker.py`, then restart the server and the worker in the same window. The systemd unit does not need a new setting. An old worker can still POST a multipart result of at most 16MiB. A larger multipart result gets 413 until that worker is updated, and the server closes the connection instead of buffering it. Caddy's `request_body max_size 512MB` matches `RELAY_MAX_BODY`. It does not lift the 16MiB multipart cap.
 
 ## Without a VPS
 
@@ -76,7 +100,7 @@ sed -e 's#__LABEL__#com.you.mac-relay.worker#' -e "s#__INSTALL_DIR__#$HOME/.conf
     mac/com.example.mac-relay.worker.plist > ~/Library/LaunchAgents/com.you.mac-relay.worker.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.you.mac-relay.worker.plist
 ```
-Tool templates are argv lists. They can use `{prompt} {prompt_file} {inbox} {outbox} {task_id}`. Each task runs detached, in its own session, with no timeout, and with `cwd` set to its outbox. It also gets the env vars `RELAY_INBOX`, `RELAY_OUTBOX`, and `RELAY_TASK_ID`. Every file the tool writes to the outbox is uploaded, together with `stdout.txt` and `stderr.txt`. The summary is the last non-empty stdout line. On failure it is `exit N: <last stderr line>`.
+Tool templates are argv lists. They can use `{prompt} {prompt_file} {inbox} {outbox} {task_id}`. Each task runs detached, in its own session, with no timeout, and with `cwd` set to its outbox. It also gets the env vars `RELAY_INBOX`, `RELAY_OUTBOX`, and `RELAY_TASK_ID`. Every non-empty file the tool writes to the outbox is uploaded with streaming PUT, together with `stdout.txt` and `stderr.txt`, and the result POST is JSON (`files` lists those names). The summary is the last non-empty stdout line. On failure it is `exit N: <last stderr line>`.
 
 **Restarts:** a task keeps running if the worker dies. After a restart, the worker uploads every finished task that has no `uploaded` marker. If a process vanished, for example after a reboot, the worker reports it once as `failed`.
 
