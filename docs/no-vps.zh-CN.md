@@ -28,6 +28,8 @@
 | `RELAY_DATA_DIR` | 否 | `./data` | SQLite 和任务文件。相对路径跟着进程的工作目录 |
 | `RELAY_BIND` | 否 | `127.0.0.1` | 监听地址 |
 | `RELAY_PORT` | 否 | `18790` | 监听端口 |
+| `RELAY_MAX_SOFT_BODY` | 否 | `16777216`（16MiB） | multipart 上限。更大的 `Content-Length` 返回 413，服务器不读 body 并关闭连接 |
+| `RELAY_MAX_BODY` | 否 | `536870912`（512MiB） | 其余请求体的硬上限，包括流式 PUT |
 
 仓库里的 `deploy/mac-relay.service` 故意写着 `RELAY_BIND=127.0.0.1`，这样只有本机反代能连上。默认值不是 tailnet 监听。Tailscale 对端或任何其他机器要连这个进程，启动前必须把 `RELAY_BIND` 设成 `0.0.0.0`，或设成那块网卡的地址。从*另一台*机器上检查。对 `127.0.0.1` 的 `curl` 在绑定 `127.0.0.1` 和 `0.0.0.0` 时都会成功，不能证明绑定已经改掉。
 
@@ -36,6 +38,22 @@
 服务器不说 TLS。客户端 URL 里的 `https://` 只有在别的东西终结 TLS 再把 HTTP 转过来时才成立（VPS 路径上的 Caddy，或布局 3 的隧道）。
 
 服务器不读 `RELAY_URL`。这个变量只给 box 上的工具用。
+
+### 大输出和 multipart 上限
+
+`RELAY_MAX_SOFT_BODY` 只作用于 `multipart/*`。`RELAY_MAX_BODY` 是流式 PUT 和 JSON body 的硬上限。`GET /health` 用 `soft_body` 和 `max_body` 报出这两个数。默认时 body 是 `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`。
+
+Worker 的输出是 `PUT /tasks/{id}/files/{name}?kind=out`，`Content-Type: application/octet-stream`，`Content-Length` 等于文件大小。服务器按 1MiB 一块把流写到磁盘（先写 `.partial`，再 `rename`）。然后 worker 向 `/tasks/{id}/result` POST JSON：
+
+```json
+{"status": "done", "summary": "stdout 最后一行", "files": ["stdout.txt", "notes.txt"]}
+```
+
+`status` 是 `done` 或 `failed`。`files` 列出已经在该任务 `out` 目录里的文件名。磁盘上没有的名字会被丢掉。第一个结果仍然有效。`GET /files/{id}/in|out/{name}` 带 `Content-Length`，按 1MiB 一块读出，下载不会装进一个缓冲区。`worker.json` 的 `max_soft_file` 只在启动时写日志，不会把 worker 切回 multipart。
+
+**box 客户端（`bin/relay-send --file`）带上的任务输入附件仍然是 multipart，上限仍然是 16MiB。** `relay-send` 不会调用 PUT。这一页的几种布局都没有双向大文件传输。只有 worker 的输出使用流式 PUT。
+
+升级：装上新的 `relay/server.py` 和 `mac/relay-worker.py`，然后两个都重启。旧 worker 仍然可以提交不超过 16MiB 的 multipart 结果。更大的结果会得到 413，连接被关掉，直到那台 worker 换掉。用默认值时不用加新的环境变量。
 
 ### 密钥
 
@@ -73,7 +91,7 @@ chmod 600 /path/to/secret
 
 ### 冒烟
 
-`GET /health` 不鉴权，返回 `{"ok": true}`。其他路径没有 bearer 时返回 401。`/health` 开放不等于队列开放。
+`GET /health` 不鉴权。限制是默认值时，返回 `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`。`soft_body` 和 `max_body` 就是 `RELAY_MAX_SOFT_BODY` 和 `RELAY_MAX_BODY`。其他路径没有 bearer 时返回 401。`/health` 开放不等于队列开放。
 
 ```sh
 curl -sS "http://127.0.0.1:18790/health"          # 在跑服务器的那台机器上
@@ -83,7 +101,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 
 把源站换成那个客户端真正使用的基址。你要的是这段 JSON，不是代理返回的 HTML 404。
 
-box agent 和 worker 的其余部分不变。唤醒文件、工具 argv 模板，以及 `mac/relay-worker.py` 的 LaunchAgent，都在 README 里。工具模板仍以 `examples/worker.example.json` 为准。
+唤醒文件、工具 argv 模板，以及 `mac/relay-worker.py` 的 LaunchAgent，都在 README 里。工具模板仍以 `examples/worker.example.json` 为准。升级时要换上当前的 `mac/relay-worker.py`：它用 PUT 上传输出，再 POST JSON 结果。
 
 ## 1. 中继在 Mac 上，box 走 Tailscale
 
@@ -132,14 +150,14 @@ export RELAY_PORT=18790
 /usr/bin/python3 /path/to/mac-relay/relay/server.py
 ```
 
-标准错误里应有 `mac-relay listening on 0.0.0.0 18790`。在 Mac 上：
+标准错误里应有 `mac-relay listening on 0.0.0.0 18790 soft_body 16777216`。在 Mac 上：
 
 ```sh
 curl -sS http://127.0.0.1:18790/health
 curl -sS "http://$(tailscale ip -4):18790/health"
 ```
 
-两条都必须打出 `{"ok": true}`。如果只有 localhost 成功，进程仍然绑在 `127.0.0.1`。
+两条都必须打出 `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`。如果只有 localhost 成功，进程仍然绑在 `127.0.0.1`。
 
 然后单独做一个 LaunchAgent，不要和 worker 的 agent 混在一起。launchd 不展开 `~` 和 `$HOME`。把 `YOU` 和克隆路径换成你的。
 
@@ -211,6 +229,7 @@ nohup bin/relay-box-agent >> /workspace/relay/agent.log 2>&1 &
   "secret_file": "~/.config/mac-relay/secret",
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
+  "max_soft_file": 16777216,
   "fail_threshold": 3,
   "cooldown_s": 300,
   "max_backoff_s": 60,
@@ -222,7 +241,7 @@ nohup bin/relay-box-agent >> /workspace/relay/agent.log 2>&1 &
 }
 ```
 
-不要写 `fallback_url` 和 `fallback_source_ip`。`tools` 的值是 `examples/worker.example.json` 里的占位命令，换成你真正要跑的命令。`secret_file` 和 `state_dir` 会展开 `~`。服务器 LaunchAgent 的环境变量不会。
+不要写 `fallback_url` 和 `fallback_source_ip`。`max_soft_file` 可以不写，写了也只进日志；worker 仍然用 PUT 上传。`tools` 的值是 `examples/worker.example.json` 里的占位命令，换成你真正要跑的命令。`secret_file` 和 `state_dir` 会展开 `~`。服务器 LaunchAgent 的环境变量不会。
 
 另一个合法的 `primary_url` 是 `http://100.x.y.z:18790`（这台 Mac 自己的 Tailscale 地址）。它得扛得住系统代理。没有特殊原因就用 `127.0.0.1`。
 
@@ -238,7 +257,7 @@ nohup bin/relay-box-agent >> /workspace/relay/agent.log 2>&1 &
 
 ### 冒烟
 
-在 Mac 上，“运行服务器” 里的两条 curl 都返回 `{"ok": true}`。
+在 Mac 上，“运行服务器” 里的两条 curl 都返回 `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`。
 
 在 box 上，tailnet 在线时：
 
@@ -247,7 +266,7 @@ curl -sS --max-time 5 http://100.x.y.z:18790/health
 curl -sS -o /dev/null -w '%{http_code}\n' --max-time 5 http://100.x.y.z:18790/tasks/next
 ```
 
-期望 `{"ok": true}` 和 `401`。连接被拒绝说明那个地址上没有进程在听（绑定仍是 localhost，或服务器停了）。超时说明路由、ACL、防火墙，或 Mac 在睡。然后 `bin/relay-send <slug> codex 'ping'` 应打出任务 id，worker 日志里能看到它启动。
+期望 `{"ok": true, "soft_body": 16777216, "max_body": 536870912}` 和 `401`。连接被拒绝说明那个地址上没有进程在听（绑定仍是 localhost，或服务器停了）。超时说明路由、ACL、防火墙，或 Mac 在睡。然后 `bin/relay-send <slug> codex 'ping'` 应打出任务 id，worker 日志里能看到它启动。
 
 ## 2. 中继在 box 上，Mac 走 Tailscale
 
@@ -306,7 +325,7 @@ nohup python3 /path/to/mac-relay/relay/server.py >> "$HOME/.config/mac-relay/ser
 curl -sS http://127.0.0.1:18790/health
 ```
 
-必须打出 `{"ok": true}`。这不能证明绑定。从 Mac 上执行 `curl -sS --max-time 5 http://<box 的 100.x>:18790/health` 才能证明。`<box 的 100.x>` 在 box 上用 `tailscale ip -4` 读取。
+必须打出 `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`。这不能证明绑定。从 Mac 上执行 `curl -sS --max-time 5 http://<box 的 100.x>:18790/health` 才能证明。`<box 的 100.x>` 在 box 上用 `tailscale ip -4` 读取。
 
 ### box.env
 
@@ -331,6 +350,7 @@ RELAY_WAKE_DIR=/workspace/relay/wake
   "secret_file": "~/.config/mac-relay/secret",
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
+  "max_soft_file": 16777216,
   "fail_threshold": 3,
   "cooldown_s": 300,
   "max_backoff_s": 60,
@@ -352,9 +372,9 @@ RELAY_WAKE_DIR=/workspace/relay/wake
 
 ### 冒烟
 
-在 box 上：`curl -sS http://127.0.0.1:18790/health` → `{"ok": true}`。
+在 box 上：`curl -sS http://127.0.0.1:18790/health` → `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`。
 
-在 Mac 上：`curl -sS --max-time 5 http://100.x.y.z:18790/health` → `{"ok": true}`，同一 URL 加上路径 `/tasks/next` 且不带 bearer → `401`。然后从 box 上 `relay-send`，应被 worker 领走。
+在 Mac 上：`curl -sS --max-time 5 http://100.x.y.z:18790/health` → `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`，同一 URL 加上路径 `/tasks/next` 且不带 bearer → `401`。然后从 box 上 `relay-send`，应被 worker 领走。
 
 ## 3. 本机中继加隧道
 
@@ -377,7 +397,7 @@ box agent 和 Mac worker 里，谁和服务器在同一台机器上，谁就用 
 - `cloudflared` 或 Tailscale CLI，按那个产品自己的文档安装。这个仓库不带这两个二进制。
 - bearer 密钥，规则见上面。隧道不会替 mac-relay 做鉴权。`/health` 是公开的。其他路径都要 bearer。
 
-先在那台机器上确认 `curl -sS http://127.0.0.1:18790/health` 返回 `{"ok": true}`，再把隧道指到 localhost。
+先在那台机器上确认 `curl -sS http://127.0.0.1:18790/health` 返回 `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`，再把隧道指到 localhost。
 
 如果远端还要把 `http://<服务器的 100.x>:18790` 当备用，把 `RELAY_BIND` 改成 `0.0.0.0`，并从远端重新检查这个 URL。下面写的 Funnel 和 `cloudflared` 连的是 `127.0.0.1`。进程如果只绑在 Tailscale 地址上，收不到它们的流量。`0.0.0.0` 两边都覆盖。
 
@@ -457,6 +477,7 @@ RELAY_COOLDOWN_S=300
   "secret_file": "~/.config/mac-relay/secret",
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
+  "max_soft_file": 16777216,
   "fail_threshold": 3,
   "cooldown_s": 300,
   "max_backoff_s": 60,
@@ -497,4 +518,4 @@ curl -sS --max-time 20 "https://<tunnel-host>/health"
 curl -sS -o /dev/null -w '%{http_code}\n' --max-time 20 "https://<tunnel-host>/tasks/next"
 ```
 
-期望 `{"ok": true}` 和 `401`。如果 `/health` 是 HTML 404，隧道没有指向服务器根路径，或者客户端加了服务器上根本不存在的 `/relay` 前缀。如果配了 tailnet 备用，先从远端确认 `curl -sS --max-time 5 http://100.x.y.z:18790/health` 也返回 `{"ok": true}`，再设置 `RELAY_FALLBACK_URL` / `fallback_url`。然后让 `relay-send` 走 `RELAY_URL`。
+期望 `{"ok": true, "soft_body": 16777216, "max_body": 536870912}` 和 `401`。如果 `/health` 是 HTML 404，隧道没有指向服务器根路径，或者客户端加了服务器上根本不存在的 `/relay` 前缀。如果配了 tailnet 备用，先从远端确认 `curl -sS --max-time 5 http://100.x.y.z:18790/health` 也返回 `{"ok": true, "soft_body": 16777216, "max_body": 536870912}`，再设置 `RELAY_FALLBACK_URL` / `fallback_url`。然后让 `relay-send` 走 `RELAY_URL`。

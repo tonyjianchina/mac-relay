@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """mac-relay server: tiny task queue between box agents and a Mac worker.
 Stdlib only. Env: RELAY_SECRET_FILE (required), RELAY_DATA_DIR (default ./data),
-RELAY_BIND (127.0.0.1), RELAY_PORT (18790). The secret is never logged."""
+RELAY_BIND (127.0.0.1), RELAY_PORT (18790), RELAY_MAX_BODY (512MiB hard),
+RELAY_MAX_SOFT_BODY (16MiB multipart soft limit). The secret is never logged.
+
+Large result files: PUT /tasks/{id}/files/{name} (octet-stream, streamed to disk),
+then POST /tasks/{id}/result as application/json with status/summary/files[].
+Multipart result bodies over the soft limit are rejected (413)."""
 import hmac, json, os, re, select, socket, sqlite3, sys, threading, time
 from email.parser import BytesParser
 from email.policy import HTTP
@@ -11,6 +16,8 @@ from urllib.parse import urlparse, parse_qs, unquote
 TOOLS = {"hermes", "deepseek", "codex", "schwab"}
 SAFE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_BODY = int(os.environ.get("RELAY_MAX_BODY", 512 * 1024 * 1024))
+MAX_SOFT_BODY = int(os.environ.get("RELAY_MAX_SOFT_BODY", 16 * 1024 * 1024))
+CHUNK = 1024 * 1024
 MAX_WAIT = 55
 CLAIM_TTL = float(os.environ.get("RELAY_CLAIM_TTL", 20))  # unconfirmed claim -> redeliver
 
@@ -90,8 +97,23 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if getattr(self, "close_connection", 0):
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def send_file(self, path):
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(CHUNK)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
     def authed(self):
         h = self.headers.get("Authorization", "")
@@ -114,6 +136,26 @@ class H(BaseHTTPRequestHandler):
             raise ValueError("body too large")
         return self.rfile.read(n)
 
+    def stream_to_file(self, path, n):
+        """Read exactly n bytes from the request into path (via .partial + replace)."""
+        tmp = path + ".partial"
+        left = n
+        try:
+            with open(tmp, "wb") as f:
+                while left > 0:
+                    chunk = self.rfile.read(min(CHUNK, left))
+                    if not chunk:
+                        raise ValueError("short body")
+                    f.write(chunk)
+                    left -= len(chunk)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
     def route(self):
         u = urlparse(self.path)
         return [unquote(p) for p in u.path.strip("/").split("/") if p], parse_qs(u.query)
@@ -121,7 +163,7 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         parts, q = self.route()
         if parts == ["health"]:
-            return self.send(200, {"ok": True})
+            return self.send(200, {"ok": True, "soft_body": MAX_SOFT_BODY, "max_body": MAX_BODY})
         if not self.authed():
             return
         st = self.server.store
@@ -158,8 +200,35 @@ class H(BaseHTTPRequestHandler):
             p = os.path.join(st.data, "files", tid, kind, name)
             if not os.path.isfile(p):
                 return self.send(404, {"error": "not found"})
-            with open(p, "rb") as f:
-                return self.send(200, raw=f.read(), ctype="application/octet-stream")
+            return self.send_file(p)
+        self.send(404, {"error": "no route"})
+
+    def do_PUT(self):
+        parts, q = self.route()
+        if not self.authed():
+            return
+        # PUT /tasks/{tid}/files/{name}?kind=out|in  — stream octet-stream to disk
+        if len(parts) == 4 and parts[0] == "tasks" and parts[2] == "files":
+            tid, name = parts[1], safe_name(parts[3])
+            kind = (q.get("kind", ["out"])[0] or "out")
+            if kind not in ("in", "out") or not SAFE.match(tid) or not name:
+                return self.send(400, {"error": "bad name"})
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0:
+                return self.send(400, {"error": "Content-Length required"})
+            if n > MAX_BODY:
+                return self.send(413, {"error": "body too large"})
+            st = self.server.store
+            with st.lock:
+                if not st.row(tid):
+                    return self.send(404, {"error": "unknown task"})
+            dest = os.path.join(st.fdir(tid, kind), name)
+            try:
+                self.stream_to_file(dest, n)
+            except ValueError as e:
+                return self.send(400, {"error": str(e)})
+            log("put-file", tid, kind, name, n)
+            return self.send(200, {"id": tid, "name": name, "bytes": n, "kind": kind})
         self.send(404, {"error": "no route"})
 
     def do_POST(self):
@@ -167,12 +236,20 @@ class H(BaseHTTPRequestHandler):
         if not self.authed():
             return
         st = self.server.store
+        ctype = self.headers.get("Content-Type", "")
+        n = int(self.headers.get("Content-Length") or 0)
+        # Soft-limit multipart so email parser cannot balloon host memory (see 2026-11-07 OOM).
+        if ctype.startswith("multipart/") and n > MAX_SOFT_BODY:
+            self.close_connection = True
+            return self.send(413, {
+                "error": f"multipart over soft limit {MAX_SOFT_BODY}; "
+                         "PUT /tasks/{id}/files/{name} then POST JSON result"})
         try:
             raw = self.body()
         except ValueError as e:
             return self.send(413, {"error": str(e)})
         if parts == ["tasks"]:
-            fields, files = parse_any(self.headers.get("Content-Type", ""), raw)
+            fields, files = parse_any(ctype, raw)
             tid, sender, tool = fields.get("id", ""), fields.get("sender", ""), fields.get("tool", "")
             if not SAFE.match(tid) or not SAFE.match(sender) or tool not in TOOLS or not fields.get("prompt"):
                 return self.send(400, {"error": "need id, sender, tool in hermes|deepseek|codex|schwab, prompt"})
@@ -181,12 +258,12 @@ class H(BaseHTTPRequestHandler):
                     return self.send(200, {"id": tid, "duplicate": True})
                 names = []
                 for name, data in files:
-                    n = safe_name(name)
-                    if not n:
+                    nme = safe_name(name)
+                    if not nme:
                         return self.send(400, {"error": "bad attachment name"})
-                    with open(os.path.join(st.fdir(tid, "in"), n), "wb") as f:
+                    with open(os.path.join(st.fdir(tid, "in"), nme), "wb") as f:
                         f.write(data)
-                    names.append(n)
+                    names.append(nme)
                 st.db.execute("insert into tasks(id,sender,tool,prompt,attachments,state,created) values(?,?,?,?,?,'queued',?)",
                               (tid, sender, tool, fields["prompt"], json.dumps(names), time.time()))
                 st.db.commit(); st.cond.notify_all()
@@ -194,7 +271,7 @@ class H(BaseHTTPRequestHandler):
             return self.send(201, {"id": tid})
         if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "result":
             tid = parts[1]
-            fields, files = parse_any(self.headers.get("Content-Type", ""), raw)
+            fields, files = parse_any(ctype, raw)
             status = fields.get("status")
             if status not in ("done", "failed"):
                 return self.send(400, {"error": "status must be done|failed"})
@@ -206,11 +283,23 @@ class H(BaseHTTPRequestHandler):
                     return self.send(200, {"id": tid, "duplicate": True})
                 names = []
                 for name, data in files:
-                    n = safe_name(name)
-                    if n:
-                        with open(os.path.join(st.fdir(tid, "out"), n), "wb") as f:
+                    nme = safe_name(name)
+                    if nme:
+                        with open(os.path.join(st.fdir(tid, "out"), nme), "wb") as f:
                             f.write(data)
-                        names.append(n)
+                        names.append(nme)
+                # Files pre-uploaded via PUT /tasks/{id}/files/{name}
+                listed = fields.get("files")
+                if listed:
+                    try:
+                        arr = json.loads(listed) if isinstance(listed, str) else listed
+                    except Exception:
+                        arr = []
+                    if isinstance(arr, list):
+                        for item in arr:
+                            nme = safe_name(item if isinstance(item, str) else "")
+                            if nme and os.path.isfile(os.path.join(st.fdir(tid, "out"), nme)) and nme not in names:
+                                names.append(nme)
                 summary = " ".join((fields.get("summary") or "").split())[:300]
                 st.db.execute("update tasks set state=?, status=?, summary=?, files=?, finished=? where id=?",
                               (status, status, summary, json.dumps(names), time.time(), tid))
@@ -268,7 +357,7 @@ def main():
     srv.daemon_threads = True
     srv.secret = secret
     srv.store = Store(os.environ.get("RELAY_DATA_DIR", "./data"))
-    log("mac-relay listening on", *srv.server_address[:2])
+    log("mac-relay listening on", *srv.server_address[:2], "soft_body", MAX_SOFT_BODY)
     srv.serve_forever()
 
 if __name__ == "__main__":

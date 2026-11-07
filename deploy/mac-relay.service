@@ -8,6 +8,9 @@ Environment=RELAY_BIND=127.0.0.1
 Environment=RELAY_PORT=18790
 Environment=RELAY_DATA_DIR=/var/lib/mac-relay
 Environment=RELAY_SECRET_FILE=/etc/mac-relay/secret
+# Optional caps, in bytes. Defaults: multipart 16MiB, everything else 512MiB.
+# Environment=RELAY_MAX_SOFT_BODY=16777216
+# Environment=RELAY_MAX_BODY=536870912
 ExecStart=/usr/bin/python3 /opt/mac-relay/relay/server.py
 Restart=on-failure
 RestartSec=3

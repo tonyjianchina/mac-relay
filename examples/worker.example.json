@@ -4,6 +4,7 @@
   "secret_file": "~/.config/mac-relay/secret",
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
+  "max_soft_file": 16777216,
   "fail_threshold": 3,
   "cooldown_s": 300,
   "max_backoff_s": 60,
