@@ -27,7 +27,7 @@ RES = os.path.join(T, "results")
 ENV = dict(os.environ, RELAY_URL=URL, RELAY_SECRET_FILE=SECRET, RELAY_DATA_DIR=os.path.join(T, "data"),
            RELAY_PORT=str(PORT), RELAY_CLAIM_TTL="5", RELAY_RESULTS_DIR=RES, RELAY_WAKE_DIR=WAKE)
 stub = [sys.executable, os.path.join(ROOT, "tests/stub_tool.py")]
-import urllib.request, urllib.error
+import urllib.request, urllib.error, urllib.parse
 BROKEN = {"on": True}  # FLAKY = primary that answers 503 (like Caddy with a dead upstream) until healed
 class Flaky(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -49,13 +49,15 @@ class Flaky(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", FLAKY), Flaky).serve_forever, daemon=True).start()
 def wcfg(primary, name, **kw):
+    state = kw.pop("state_dir_name", "mac-state")
     p = os.path.join(T, name)
-    json.dump({"primary_url": primary, "fallback_url": URL, "secret_file": SECRET, "state_dir": os.path.join(T, "mac-state"),
+    json.dump({"primary_url": primary, "fallback_url": URL, "secret_file": SECRET, "state_dir": os.path.join(T, state),
                "worker_name": "mac", "fail_threshold": 2, "cooldown_s": 3600, "max_backoff_s": 4,
                "tools": {t: stub + [t, "{prompt}"] for t in ("hermes", "deepseek", "codex", "schwab")}, **kw}, open(p, "w"))
     return p
 CFG_OK, CFG_FB = wcfg(URL, "worker.json"), wcfg(f"http://127.0.0.1:{DEAD}", "worker-fb.json")
 CFG_503 = wcfg(f"http://127.0.0.1:{FLAKY}", "worker-503.json", cooldown_s=4, fallback_source_ip="127.0.0.1")
+CFG_ISO = wcfg(URL, "worker-iso.json", state_dir_name="mac-state-iso", upload_4xx_quarantine=2, max_backoff_s=2)
 P = {}
 def spawn(name, cmd):
     P[name] = subprocess.Popen(cmd, env=ENV, stdout=open(f"{T}/{name}.log", "a"), stderr=subprocess.STDOUT, start_new_session=True)
@@ -341,6 +343,185 @@ def _():
     e = dict(ENV, RELAY_URL=f"http://127.0.0.1:{DEAD}", RELAY_FALLBACK_URL=URL)
     tid = subprocess.run([f"{ROOT}/bin/relay-send", "beta", "hermes", "send via fallback"], env=e, capture_output=True, text=True, check=True).stdout.strip()
     wait_result(tid, 40); time.sleep(2); expect_wakes(tid, "beta"); return "enqueued on fallback, started+done"
+
+def load_server():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("relay_server_under_test", os.path.join(ROOT, "relay", "server.py"))
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
+
+def raw_http(method, path, body=b""):
+    """Send one HTTP/1.1 request with the path bytes exactly as given (no client normalization)."""
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+    try:
+        head = f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {bearer()}\r\n"
+        if method != "GET":
+            head += f"Content-Type: application/octet-stream\r\nContent-Length: {len(body)}\r\n"
+        s.sendall(head.encode() + b"\r\n" + (body if method != "GET" else b""))
+        f = s.makefile("rb")
+        status = f.readline().decode()
+        hdrs = {}
+        while True:
+            line = f.readline()
+            if line in (b"\r\n", b"\n", b""): break
+            k, v = line.decode().split(":", 1); hdrs[k.lower()] = v.strip()
+        return status, f.read(int(hdrs.get("content-length", "0")))
+    finally:
+        s.close()
+
+@test("unicode filename PUT/GET; traversal and empty 400; tid stays ASCII")
+def _():
+    kill("worker"); kill("agent")
+    try:
+        srv = load_server()
+        assert srv.safe_name("验收结果.md") == "验收结果.md"
+        assert srv.safe_name("a..b.md") == "a..b.md"
+        assert srv.safe_name("..") is None and srv.safe_name("../evil") is None
+        assert srv.safe_name("..\\evil") is None and srv.safe_name("") is None
+        assert srv.safe_name("a/b") is None and srv.safe_name("a\\b") is None
+        assert srv.safe_name("a\x00b") is None and srv.safe_name("n" * 129) is None
+        assert srv.safe_name("验" * 20) == "验" * 20  # 60 bytes, under the cap
+        assert srv.safe_name("验" * 100) is None  # 300 bytes, would not fit on disk
+        assert srv.SAFE.match("task-1") and not srv.SAFE.match("验收") and not srv.SAFE.match("n" * 129)
+        tid = "cjk-name-1"
+        st, raw, _ = api("POST", "/tasks", json.dumps({
+            "id": tid, "sender": "alpha", "tool": "hermes", "prompt": "unicode name"}).encode(), "application/json")
+        assert st == 201, (st, raw)
+        name, body = "验收结果.md", "验收通过\n".encode()
+        qn = urllib.parse.quote(name, safe="")
+        st, raw, _ = api("PUT", f"/tasks/{tid}/files/{qn}?kind=out", body, "application/octet-stream")
+        assert st == 200, (st, raw)
+        got = json.loads(raw)
+        assert got["name"] == name and got["bytes"] == len(body), got
+        st, raw, _ = api("GET", f"/files/{tid}/out/{qn}")
+        assert st == 200 and raw == body, (st, raw)
+        disk = os.path.join(T, "data", "files", tid, "out", name)
+        assert open(disk, "rb").read() == body, "stored under a different name"
+        st, raw, _ = api("PUT", f"/tasks/{tid}/files/{urllib.parse.quote('a..b.md', safe='')}?kind=out",
+                         b"dots", "application/octet-stream")
+        assert st == 200, (st, raw)
+        st, raw, _ = api("POST", f"/tasks/{tid}/result", json.dumps({
+            "status": "done", "summary": "cjk file", "files": [name, "a..b.md", "missing.bin"]}).encode(),
+                         "application/json")
+        assert st == 200, (st, raw)
+        task = json.loads(api("GET", f"/tasks/{tid}")[1])["task"]
+        assert task["files"] == [name, "a..b.md"], task
+        st, raw, _ = api("POST", f"/results/{tid}/ack", b"{}", "application/json")
+        assert st == 200, (st, raw)
+        # Attachment names use the same safe_name path.
+        at = "cjk-att-1"
+        boundary, payload = "bndcjk", "附件".encode()
+        mp = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"id\"\r\n\r\n{at}\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"sender\"\r\n\r\nalpha\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"tool\"\r\n\r\nhermes\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nattach\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n"
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode() + payload + f"\r\n--{boundary}--\r\n".encode()
+        st, raw, _ = api("POST", "/tasks", mp, f"multipart/form-data; boundary={boundary}")
+        assert st == 201, (st, raw)
+        st, raw, _ = api("GET", f"/files/{at}/in/{qn}")
+        assert st == 200 and raw == payload, (st, raw)
+        st, raw, _ = api("POST", f"/tasks/{at}/result", json.dumps({
+            "status": "done", "summary": "att"}).encode(), "application/json")
+        assert st == 200, (st, raw)
+        assert api("POST", f"/results/{at}/ack", b"{}", "application/json")[0] == 200
+        st, raw, _ = api("POST", "/tasks", json.dumps({
+            "id": "任务", "sender": "alpha", "tool": "hermes", "prompt": "no"}).encode(), "application/json")
+        assert st == 400, (st, raw)
+        st, raw, _ = api("PUT", "/tasks/" + urllib.parse.quote("任务", safe="") + "/files/a.txt?kind=out",
+                         b"hi", "application/octet-stream")
+        assert st == 400 and b"bad name" in raw, (st, raw)
+        bad_paths = [
+            f"/tasks/{tid}/files/..%2Fevil?kind=out",
+            f"/tasks/{tid}/files/../evil?kind=out",
+            f"/tasks/{tid}/files/?kind=out",
+            f"/tasks/{tid}/files/..?kind=out",
+            f"/tasks/{tid}/files/%2e%2e?kind=out",
+            f"/tasks/{tid}/files/a%00b?kind=out",
+            f"/tasks/{tid}/files/..%5Cevil?kind=out",
+            f"/tasks/{tid}/files/{'n' * 129}?kind=out",
+            f"/files/{tid}/out/..%2Fevil",
+            f"/files/{tid}/out/../evil",
+            f"/files/{tid}/out/",
+            f"/files/{tid}/out/..",
+        ]
+        for path in bad_paths:
+            status, resp = raw_http("PUT" if path.startswith("/tasks/") else "GET", path, b"x")
+            assert "400" in status and b"bad name" in resp, (path, status, resp)
+        return "PUT/GET 验收结果.md; ../evil and empty 400; tid ASCII"
+    finally:
+        worker(); agent()
+
+@test("one task upload 4xx does not block others; quarantine keeps files")
+def _():
+    kill("worker"); kill("agent")
+    try:
+        bad, good = "iso-bad", "iso-good"
+        assert bad < good  # sweep is sorted; a head-of-line return would skip good
+        for tid in (bad, good):
+            st, raw, _ = api("POST", "/tasks", json.dumps({
+                "id": tid, "sender": "alpha", "tool": "hermes", "prompt": "iso"}).encode(), "application/json")
+            assert st == 201, (st, raw)
+            st, raw, _ = api("POST", f"/tasks/{tid}/result", json.dumps({
+                "status": "done", "summary": "seed"}).encode(), "application/json")
+            assert st == 200, (st, raw)
+            assert api("POST", f"/results/{tid}/ack", b"{}", "application/json")[0] == 200
+        root = os.path.join(T, "mac-state-iso")
+        def seed(tid, out_name, out_body):
+            d = os.path.join(root, "tasks", tid); out = os.path.join(d, "out"); os.makedirs(out)
+            open(os.path.join(d, "stdout.txt"), "w").write(f"line {tid}\n")
+            open(os.path.join(d, "exitcode"), "w").write("0")
+            open(os.path.join(d, "pid"), "w").write("999999")
+            open(os.path.join(d, "confirmed"), "w").write("1")
+            open(os.path.join(out, out_name), "wb").write(out_body)
+            return d
+        long_name = "n" * 129
+        cjk = "验收结果.md"
+        cjk_body = "验收通过\n".encode()
+        bad_dir = seed(bad, long_name, b"nope")
+        good_dir = seed(good, cjk, cjk_body)
+        # A log-line counter would already be over the threshold before any real 4xx.
+        with open(f"{T}/worker.log", "a") as logf:
+            for _i in range(9):
+                logf.write(f"upload error {bad} 400 {{\"error\": \"bad name\"}}\n")
+        worker(CFG_ISO)
+        saw_isolated = False
+        end = time.time() + 20
+        cpath, qpath = os.path.join(bad_dir, "upload-4xx"), os.path.join(bad_dir, "quarantine")
+        gpath = os.path.join(good_dir, "uploaded")
+        while time.time() < end:
+            # Counter stays at 1 for the backoff gap. Good must already be uploaded then,
+            # which is only true if the sweep continued past the bad task.
+            if os.path.isfile(cpath) and not os.path.isfile(qpath):
+                n = int(open(cpath).read().strip() or "0")
+                if n == 1 and os.path.isfile(gpath):
+                    saw_isolated = True
+            if os.path.isfile(qpath) and os.path.isfile(gpath):
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError(
+                f"timed out; counter={os.path.isfile(cpath)} quarantine={os.path.isfile(qpath)} uploaded={os.path.isfile(gpath)}")
+        assert saw_isolated, "good task was not uploaded during the first 4xx"
+        assert int(open(cpath).read().strip()) == 2
+        assert open(qpath).read().strip() == "2"
+        assert not os.path.exists(os.path.join(bad_dir, "uploaded"))
+        assert open(os.path.join(bad_dir, "stdout.txt")).read().startswith("line ")
+        assert open(os.path.join(bad_dir, "out", long_name), "rb").read() == b"nope"
+        st, raw, _ = api("GET", f"/files/{good}/out/{urllib.parse.quote(cjk, safe='')}")
+        assert st == 200 and raw == cjk_body, (st, raw)
+        wlog = open(f"{T}/worker.log", encoding="utf-8").read()
+        stamped = [ln for ln in wlog.splitlines() if f" upload error {bad} 400 " in ln and "T" in ln[:20]]
+        assert len(stamped) == 2, stamped
+        assert all('{"error": "bad name"}' in ln for ln in stamped), stamped
+        assert f"quarantine {bad} consecutive-4xx 2" in wlog
+        assert f"uploaded {good} done" in wlog and f"put-file {good} out {cjk}" in wlog
+        return "good uploaded while bad was at 1x 4xx; quarantine kept files"
+    finally:
+        if P["worker"].poll() is None:
+            kill("worker")
+        worker(); agent()
 
 for n in list(P): kill(n)
 # Each task that called /started should contribute exactly 2 wakes (started + final).

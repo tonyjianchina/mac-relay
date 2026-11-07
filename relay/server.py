@@ -14,7 +14,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOLS = {"hermes", "deepseek", "codex", "schwab"}
+# Task ids and sender slugs. Do not loosen this for file names.
 SAFE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# One path segment. Unicode (including CJK) is allowed. 128 characters matches the
+# old ASCII cap; 247 UTF-8 bytes leaves room for the ".partial" temp suffix (NAME_MAX 255).
+_NAME_MAX_CHARS = 128
+_NAME_MAX_BYTES = 255 - len(".partial")
 MAX_BODY = int(os.environ.get("RELAY_MAX_BODY", 512 * 1024 * 1024))
 MAX_SOFT_BODY = int(os.environ.get("RELAY_MAX_SOFT_BODY", 16 * 1024 * 1024))
 CHUNK = 1024 * 1024
@@ -25,8 +30,25 @@ def log(*a):
     print(time.strftime("%Y-%m-%dT%H:%M:%S"), *a, file=sys.stderr, flush=True)
 
 def safe_name(n):
-    n = os.path.basename(n or "")
-    return n if SAFE.match(n) else None
+    """Attachment or result file name. Unicode, including CJK, is allowed.
+
+    Rejects path traversal and names that cannot be stored as a single segment:
+    empty, ".", "..", "/", "\\", NUL and other controls, over 128 characters,
+    or over 247 UTF-8 bytes. Task ids stay on SAFE (ASCII only).
+    """
+    if not isinstance(n, str) or n in ("", ".", ".."):
+        return None
+    if "/" in n or "\\" in n or "\x00" in n:
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in n):
+        return None
+    try:
+        raw = n.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if len(n) > _NAME_MAX_CHARS or len(raw) > _NAME_MAX_BYTES:
+        return None
+    return n
 
 class Store:
     def __init__(self, data):
@@ -193,8 +215,10 @@ class H(BaseHTTPRequestHandler):
             with st.lock:
                 d = st.row(parts[1])
             return self.send(200, {"task": task_view(d)}) if d else self.send(404, {"error": "not found"})
-        if len(parts) == 4 and parts[0] == "files" and parts[2] in ("in", "out"):
-            tid, kind, name = parts[1], parts[2], safe_name(parts[3])
+        if parts and parts[0] == "files" and len(parts) >= 3 and parts[2] in ("in", "out"):
+            # Missing, empty, or multi-segment names (../evil) are 400, not 404.
+            tid, kind = parts[1], parts[2]
+            name = safe_name(parts[3]) if len(parts) == 4 else None
             if not SAFE.match(tid) or not name:
                 return self.send(400, {"error": "bad name"})
             p = os.path.join(st.data, "files", tid, kind, name)
@@ -208,8 +232,10 @@ class H(BaseHTTPRequestHandler):
         if not self.authed():
             return
         # PUT /tasks/{tid}/files/{name}?kind=out|in  — stream octet-stream to disk
-        if len(parts) == 4 and parts[0] == "tasks" and parts[2] == "files":
-            tid, name = parts[1], safe_name(parts[3])
+        if parts and parts[0] == "tasks" and len(parts) >= 3 and parts[2] == "files":
+            # One segment only. ../evil, an empty name, or a non-ASCII task id is 400.
+            tid = parts[1]
+            name = safe_name(parts[3]) if len(parts) == 4 else None
             kind = (q.get("kind", ["out"])[0] or "out")
             if kind not in ("in", "out") or not SAFE.match(tid) or not name:
                 return self.send(400, {"error": "bad name"})
