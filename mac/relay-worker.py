@@ -7,7 +7,11 @@ stdout + outbox files exactly once. Unacked results are re-uploaded after restar
 Large outputs: PUT /tasks/{id}/files/{name} as octet-stream (streamed from disk), then
 POST /tasks/{id}/result as application/json. This worker always uses that path so the
 server never parses a multipart result. max_soft_file (default 16MiB) is logged only;
-it does not select a transport. Box clients still enqueue attachments as multipart."""
+it does not select a transport. Box clients still enqueue attachments as multipart.
+
+One task's upload failure does not stop the sweep. HTTP error bodies are logged.
+upload_4xx_quarantine (default 3) consecutive HTTP 4xx responses write a quarantine
+marker and leave the task directory on disk; the count lives in upload-4xx, not in a log."""
 import json, os, signal, subprocess, sys, threading, time, uuid, urllib.request, urllib.parse, urllib.error
 
 def log(*a):
@@ -87,6 +91,19 @@ class Conn:
 CONN = Conn()
 signal.signal(signal.SIGHUP, lambda *a: CONN.set("primary"))
 
+def _http_body(e):
+    """Response body attached by req(), or read once here. Empty string if unavailable."""
+    body = getattr(e, "relay_body", None)
+    if body is not None:
+        return body
+    try:
+        raw = e.read()
+    except Exception:
+        raw = b""
+    if isinstance(raw, str):
+        return raw
+    return (raw or b"").decode("utf-8", "replace")
+
 def req(method, path, body=None, ctype=None, timeout=70, content_length=None):
     base, opener = CONN.base()
     r = urllib.request.Request(base.rstrip("/") + path, data=body, method=method)
@@ -99,15 +116,24 @@ def req(method, path, body=None, ctype=None, timeout=70, content_length=None):
             data = resp.read(); CONN.ok(); return resp.status, data
     except urllib.error.HTTPError as e:
         # 5xx (502/503/504 from Caddy/CDN) = channel broken -> counts toward failover; 4xx = app-level answer
+        try:
+            raw = e.read()
+        except Exception:
+            raw = b""
+        e.relay_body = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
         CONN.failed() if e.code >= 500 else CONN.ok(); raise
     except Exception:
         CONN.failed(); raise
+
+def qseg(s):
+    """Percent-encode one URL path segment, including non-ASCII names and slashes."""
+    return urllib.parse.quote(s, safe="")
 
 def put_file(tid, path, kind="out"):
     """Stream a file to PUT /tasks/{tid}/files/{name} without loading it into RAM."""
     name = os.path.basename(path)
     size = os.path.getsize(path)
-    q = urllib.parse.quote(tid), urllib.parse.quote(name)
+    q = qseg(tid), qseg(name)
     with open(path, "rb") as f:
         st, _ = req("PUT", f"/tasks/{q[0]}/files/{q[1]}?kind={kind}", f,
                     "application/octet-stream", timeout=max(300, size // (256 * 1024) + 60),
@@ -124,7 +150,7 @@ def start(task):
     inbox, outbox = os.path.join(d, "in"), os.path.join(d, "out")
     os.makedirs(inbox, exist_ok=True); os.makedirs(outbox, exist_ok=True)
     for n in task["attachments"]:
-        _, data = req("GET", f"/files/{urllib.parse.quote(tid)}/in/{urllib.parse.quote(n)}")
+        _, data = req("GET", f"/files/{qseg(tid)}/in/{qseg(n)}")
         open(os.path.join(inbox, n), "wb").write(data)
     json.dump(task, open(os.path.join(d, "task.json"), "w"))
     pf = os.path.join(d, "prompt.txt"); open(pf, "w").write(task["prompt"])
@@ -146,7 +172,7 @@ def start(task):
 def confirm(tid):
     """Tell the relay we own this task so it is not redelivered. Best effort: the sweep re-confirms."""
     try:
-        req("POST", f"/tasks/{urllib.parse.quote(tid)}/started", b"{}", "application/json", timeout=15)
+        req("POST", f"/tasks/{qseg(tid)}/started", b"{}", "application/json", timeout=15)
         open(os.path.join(TASKS, tid, "confirmed"), "w").write("1")
     except Exception as e:
         log("confirm pending", tid, type(e).__name__)
@@ -166,13 +192,46 @@ def upload_result(tid, status, summary, files):
     for path in files:
         names.append(put_file(tid, path, kind="out"))
     body = json.dumps({"status": status, "summary": summary, "files": names}).encode()
-    req("POST", f"/tasks/{urllib.parse.quote(tid)}/result", body, "application/json", timeout=60)
+    req("POST", f"/tasks/{qseg(tid)}/result", body, "application/json", timeout=60)
+
+def _4xx_path(d):
+    return os.path.join(d, "upload-4xx")
+
+def _read_4xx(d):
+    try:
+        return int(open(_4xx_path(d)).read().strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+def _write_4xx(d, n):
+    open(_4xx_path(d), "w").write(str(int(n)))
+
+def _clear_4xx(d):
+    try:
+        os.remove(_4xx_path(d))
+    except OSError:
+        pass
+
+def _quarantine_after():
+    try:
+        return max(1, int(CFG.get("upload_4xx_quarantine", 3)))
+    except (TypeError, ValueError):
+        return 3
 
 def sweep():
-    """Upload every finished-but-unacked task. Also detects processes lost across reboots."""
-    for tid in os.listdir(TASKS):
+    """Upload every finished-but-unacked task. Also detects processes lost across reboots.
+
+    A failure is isolated to that task (the sweep keeps going). Consecutive HTTP 4xx
+    are counted in upload-4xx under the task directory, which survives restarts. After
+    upload_4xx_quarantine of them, a quarantine marker is written and the files stay.
+    Transport errors do not increment or clear that count; a 5xx clears it; success clears it.
+    """
+    pending = False
+    limit = _quarantine_after()
+    for tid in sorted(os.listdir(TASKS)):
         d = os.path.join(TASKS, tid)
-        if os.path.exists(os.path.join(d, "uploaded")) or not os.path.exists(os.path.join(d, "pid")):
+        if os.path.exists(os.path.join(d, "uploaded")) or os.path.exists(os.path.join(d, "quarantine")) \
+                or not os.path.exists(os.path.join(d, "pid")):
             continue
         if tid in PROCS: PROCS[tid].poll()
         # Confirm start even after the tool exits (first confirm may have failed mid-failover).
@@ -197,17 +256,36 @@ def sweep():
         files += sorted(os.path.join(out, n) for n in os.listdir(out) if os.path.isfile(os.path.join(out, n)))
         try:
             upload_result(tid, status, summary, files)
+        except urllib.error.HTTPError as e:
+            body = _http_body(e).replace("\n", " ")
+            log("upload error", tid, e.code, body[:300])
+            if 400 <= e.code < 500:
+                n = _read_4xx(d) + 1
+                _write_4xx(d, n)
+                if n >= limit:
+                    # Marker only. Do not delete stdout, the outbox, or the counter.
+                    open(os.path.join(d, "quarantine"), "w").write(str(n))
+                    log("quarantine", tid, "consecutive-4xx", n)
+                else:
+                    pending = True
+            else:
+                _clear_4xx(d)
+                pending = True
+            continue
         except Exception as e:
-            log("upload pending", tid, type(e).__name__, str(e)[:120]); return False
+            log("upload pending", tid, type(e).__name__, str(e)[:200])
+            pending = True
+            continue
+        _clear_4xx(d)
         open(os.path.join(d, "uploaded"), "w").write(status); PROCS.pop(tid, None)
         log("uploaded", tid, status, len(files), "files")
-    return True
+    return not pending
 
 def poll_loop():
     backoff = 1
     while True:
         try:
-            st, data = req("GET", f"/tasks/next?worker={urllib.parse.quote(WORKER)}&wait=50")
+            st, data = req("GET", f"/tasks/next?worker={qseg(WORKER)}&wait=50")
             backoff = 1
             if st == 200:
                 task = json.loads(data)["task"]

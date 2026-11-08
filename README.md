@@ -27,6 +27,8 @@ box bot ──relay-send──▶ relay server (VPS, behind Caddy /relay/) ◀�
 | POST | `/results/{id}/ack` | Ack a delivery; body `{"event":"started"}` acks the started wake only (default acks done/failed) |
 | GET | `/files/{id}/in\|out/{name}` | Download an attachment or an output file, streamed in 1MiB chunks |
 
+Task ids and sender slugs stay ASCII: `[A-Za-z0-9._-]{1,128}`. Attachment and result **file names** are one path segment and may be non-ASCII (`验收结果.md`). A name is `400 {"error":"bad name"}` when it is empty, `.`, or `..`, when it contains a slash, a backslash, or NUL, or when it is longer than 128 characters (or 247 UTF-8 bytes).
+
 ## Server install (Linux, systemd + Caddy)
 ```sh
 sudo useradd --system --home /var/lib/mac-relay mac-relay
@@ -103,6 +105,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.you.mac-relay.worker
 Tool templates are argv lists. They can use `{prompt} {prompt_file} {inbox} {outbox} {task_id}`. Each task runs detached, in its own session, with no timeout, and with `cwd` set to its outbox. It also gets the env vars `RELAY_INBOX`, `RELAY_OUTBOX`, and `RELAY_TASK_ID`. Every non-empty file the tool writes to the outbox is uploaded with streaming PUT, together with `stdout.txt` and `stderr.txt`, and the result POST is JSON (`files` lists those names). The summary is the last non-empty stdout line. On failure it is `exit N: <last stderr line>`.
 
 **Restarts:** a task keeps running if the worker dies. After a restart, the worker uploads every finished task that has no `uploaded` marker. If a process vanished, for example after a reboot, the worker reports it once as `failed`.
+
+One task's upload failure does not stop the others in that sweep. On HTTP errors the worker logs the response body. `upload_4xx_quarantine` (default 3) consecutive HTTP 4xx responses write a `quarantine` marker in the task directory and stop retries. The count is the `upload-4xx` file in that directory (it survives restarts). The task's files are left in place.
 
 **Fallback:** set `fallback_url` (for example a Tailscale address) to use when the primary is down. The worker switches to it only after `fail_threshold` consecutive primary failures, and then stays on it. It goes back to the primary only when a `/health` probe succeeds after `cooldown_s`, or when you reset it manually with `touch <state_dir>/reset-primary` or `kill -HUP <pid>`. Retry backoff is exponential and capped at `max_backoff_s`.
 
