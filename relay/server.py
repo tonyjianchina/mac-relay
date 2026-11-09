@@ -60,10 +60,12 @@ class Store:
             id text primary key, sender text, tool text, prompt text, attachments text,
             state text, worker text, created real, started real, finished real,
             status text, summary text, files text, delivered integer default 0)""")
-        # started_wake: NULL=never confirmed start; 0=pending started wake; 1=started wake sent
+        # started_wake: NULL=not confirmed; 1=accepted and not a wake.
+        # Legacy 0 meant "pending started wake". Rewrite it so those rows are not pending.
         cols = {r[1] for r in self.db.execute("pragma table_info(tasks)")}
         if "started_wake" not in cols:
             self.db.execute("alter table tasks add column started_wake integer")
+        self.db.execute("update tasks set started_wake=1 where started_wake=0")
         self.db.commit()
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -97,7 +99,7 @@ class Store:
                 self.cond.wait(min(left, 2))
 
 def task_view(d, event=None):
-    """event='started' synthesizes the lightweight started wake payload; else normal result view."""
+    """Task JSON. event='started' builds the old lightweight payload; /results/next does not send it."""
     v = {k: d[k] for k in ("id", "sender", "tool", "prompt", "state", "status", "summary", "created", "finished")} | {
         "attachments": json.loads(d["attachments"] or "[]"), "files": json.loads(d["files"] or "[]")}
     if event == "started":
@@ -200,17 +202,15 @@ class H(BaseHTTPRequestHandler):
                                lambda d: (worker, time.time(), d["id"])), wait, self.peer_alive)
             return self.send(200, {"task": task_view(d)}) if d else self.send(204, raw=b"")
         if parts == ["results", "next"]:
-            # One wait: pending started wakes first, then undone done/failed deliveries.
+            # Done/failed only. Acceptance is GET /tasks/{id} (state=running); it is not a wake.
+            # Legacy started_wake=0 is not selected, so it cannot sit ahead of delivered=0.
             d = st.wait_claim(
-                "select * from tasks where started_wake=0 or "
-                "(state in ('done','failed') and delivered=0) "
-                "order by case when started_wake=0 then 0 else 1 end, "
-                "coalesce(started, finished, created) limit 1",
+                "select * from tasks where state in ('done','failed') and delivered=0 "
+                "order by coalesce(finished, created) limit 1",
                 (), None, wait, self.peer_alive)
             if not d:
                 return self.send(204, raw=b"")
-            ev = "started" if d.get("started_wake") == 0 else None
-            return self.send(200, {"task": task_view(d, event=ev)})
+            return self.send(200, {"task": task_view(d)})
         if len(parts) == 2 and parts[0] == "tasks":
             with st.lock:
                 d = st.row(parts[1])
@@ -334,13 +334,16 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"id": tid})
         if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "started":
             with st.cond:
-                # Mark started_wake=0 only once (NULL -> 0). Already-running/done tasks stay idempotent.
-                st.db.execute("update tasks set state='running', started_wake=COALESCE(started_wake, 0) "
+                # Record acceptance (queryable state=running) and mark it handled (started_wake=1).
+                # Do not leave started_wake=0: that legacy value was a pending started wake.
+                # Already done/failed rows stay as they are, so a fast finish is not rewound.
+                st.db.execute("update tasks set state='running', started_wake=1 "
                               "where id=? and state in ('claimed','running')", (parts[1],))
                 st.db.commit(); st.cond.notify_all()
             return self.send(200, {"id": parts[1]})
         if len(parts) == 3 and parts[0] == "results" and parts[2] == "ack":
-            # Optional {"event":"started"} acks the started wake only; default/empty acks done/failed (compat).
+            # {"event":"started"} only retires a legacy started_wake=0. It does not set delivered,
+            # so a later done/failed result is still handed out. Default/empty acks done/failed.
             try:
                 ev = (json.loads(raw or b"{}") or {}).get("event") if raw else None
             except Exception:

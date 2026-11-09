@@ -1,9 +1,34 @@
 #!/usr/bin/env python3
 """relay-send <sender-slug> <hermes|deepseek|codex|schwab> '<prompt>' [--file F]... [--id ID]
-Enqueues a task and prints the task id immediately. Env: RELAY_URL, RELAY_SECRET_FILE, optional RELAY_FALLBACK_URL (used once if the primary fails)."""
-import argparse, os, sys, time, uuid
+Enqueues a task, prints the task id on stdout, then polls GET /tasks/{id} until the worker
+has accepted (state running) or the task is already done/failed. Default wait 45s
+(RELAY_STARTED_WAIT_S). Success: stderr "accepted ...", exit 0. Still unaccepted when the
+wait ends: stderr 已入队、尚未接单, exit 2. Enqueue failure exits 1.
+Env: RELAY_URL, RELAY_SECRET_FILE, optional RELAY_FALLBACK_URL (used once if the primary fails)."""
+import argparse, os, sys, time, urllib.parse, uuid
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 from relay.client import Failover, multipart, secret
+
+def started_wait_s():
+    try:
+        return max(0.0, float(os.environ.get("RELAY_STARTED_WAIT_S", "45")))
+    except ValueError:
+        return 45.0
+
+def poll_accepted(conn, tid, limit):
+    """Short poll until state is running, done, or failed. None means the wait elapsed."""
+    path, deadline = "/tasks/" + urllib.parse.quote(tid, safe=""), time.monotonic() + limit
+    while True:
+        try:
+            st, data = conn.request(secret(), "GET", path, timeout=10)
+            state = data.get("task", {}).get("state") if st == 200 and isinstance(data, dict) else None
+            if state in ("running", "done", "failed"):
+                return state
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("slug"); ap.add_argument("tool", choices=["hermes", "deepseek", "codex", "schwab"]); ap.add_argument("prompt")
@@ -20,4 +45,9 @@ try:
         st, _ = conn.request(secret(), "POST", "/tasks", body, ct, timeout=60)  # idempotent by task id
 except Exception as e:
     sys.exit(f"relay-send: enqueue failed: {e}")
-print(tid)
+print(tid, flush=True)
+state = poll_accepted(conn, tid, started_wait_s())
+if state is None:
+    print("relay-send: 已入队、尚未接单", file=sys.stderr)
+    sys.exit(2)
+print(f"relay-send: accepted {tid} state={state}", file=sys.stderr)

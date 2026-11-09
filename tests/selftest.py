@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Loopback end-to-end self-test. Writes TESTS.md. Usage: python3 tests/selftest.py [--quick]"""
-import json, os, signal, socket, subprocess, sys, tempfile, threading, time, hashlib
+import json, os, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time, hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUICK = "--quick" in sys.argv
@@ -71,8 +71,17 @@ def agent(**env):
         env=dict(ENV, **env), stdout=open(f"{T}/agent.log", "a"), stderr=subprocess.STDOUT, start_new_session=True)
 def send(slug, tool, prompt, *files, tid=None):
     cmd = [f"{ROOT}/bin/relay-send", slug, tool, prompt] + sum([["--file", f] for f in files], []) + (["--id", tid] if tid else [])
-    t0 = time.time(); out = subprocess.run(cmd, env=ENV, capture_output=True, text=True, check=True).stdout.strip()
-    assert time.time() - t0 < 5, "relay-send must return immediately"; return out
+    t0 = time.time()
+    proc = subprocess.run(cmd, env=ENV, capture_output=True, text=True)
+    send.last, send.err = time.time() - t0, proc.stderr
+    assert proc.returncode == 0, f"exit {proc.returncode}\nstderr={proc.stderr}\nstdout={proc.stdout}"
+    out = proc.stdout.strip()
+    assert out and "\n" not in out, proc.stdout  # stdout is the task id only
+    assert "accepted" in proc.stderr and any(
+        s in proc.stderr for s in ("state=running", "state=done", "state=failed")), proc.stderr
+    # Acceptance is in-process. A full tool run (sleep=LONG) must not be required.
+    assert send.last < 40, f"relay-send blocked {send.last:.1f}s waiting for acceptance"
+    return out
 def wait_result(tid, timeout):
     f, end = os.path.join(RES, tid, "result.json"), time.time() + timeout
     while time.time() < end:
@@ -83,14 +92,14 @@ def wait_result(tid, timeout):
     raise AssertionError(f"no result for {tid} in {timeout}s")
 def wakes_for(tid): return [w for w in WAKES if w[1]["task_id"] == tid]
 def expect_wakes(tid, slug, final="done"):
-    """Each confirmed task: exactly one started wake, then exactly one done|failed wake."""
+    """Each confirmed task: exactly one done|failed wake, and no started webhook."""
     w = wakes_for(tid)
-    assert len(w) == 2, f"{tid}: want 2 wakes (started+{final}), got {len(w)}: {[x[1].get('status') for x in w]}"
-    assert [x[1]["status"] for x in w] == ["started", final], [x[1]["status"] for x in w]
-    for x in w:
-        assert x[0] == slug and x[2] == f"Bearer key-{slug}", "wrong wake route"
-        assert set(x[1]) == {"task_id", "status", "summary", "sender", "result_path"}, x[1]
-    assert "Mac 已接单" in w[0][1]["summary"], w[0][1]["summary"]
+    assert len(w) == 1, f"{tid}: want 1 {final} wake, got {len(w)}: {[x[1].get('status') for x in w]}"
+    body = w[0][1]
+    assert body["status"] == final, body
+    assert w[0][0] == slug and w[0][2] == f"Bearer key-{slug}", "wrong wake route"
+    assert set(body) == {"task_id", "status", "summary", "sender", "result_path"}, body
+    assert not os.path.exists(os.path.join(RES, tid, ".wake-started")), tid
 def one_wake(tid, slug):  # backward name used nowhere after rewrite; keep alias
     expect_wakes(tid, slug)
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -226,17 +235,21 @@ def _():
     assert f"uploaded {tid} done" in wlog
     return f"PUT {gn} bytes sha256 matched"
 
-@test("started wake before done wake")
+@test("no started webhook; acceptance before the tool finishes")
 def _():
-    tid = send("alpha", "hermes", "order check"); r = wait_result(tid, 20); expect_wakes(tid, "alpha")
-    w = wakes_for(tid)
-    assert w[0][1]["status"] == "started" and w[1][1]["status"] == "done"
-    assert "hermes" in w[0][1]["summary"]; return "started then done"
+    tid = send("alpha", "hermes", "sleep=3 order check")
+    assert "state=running" in send.err, send.err
+    assert send.last < 15, send.last
+    r = wait_result(tid, 20); expect_wakes(tid, "alpha")
+    assert r["status"] == "done" and not any(x[1]["status"] == "started" for x in wakes_for(tid))
+    return "poll saw running; one done wake"
 
 @test(f"long task (~{LONG}s)")
 def _():
-    tid = send("alpha", "codex", f"sleep={LONG}"); r = wait_result(tid, LONG + 40); expect_wakes(tid, "alpha")
-    assert r["status"] == "done"; return f"slept {LONG}s, no timeout"
+    t0 = time.time(); tid = send("alpha", "codex", f"sleep={LONG}")
+    assert "state=running" in send.err and time.time() - t0 < 15, (send.err, time.time() - t0)
+    r = wait_result(tid, LONG + 40); expect_wakes(tid, "alpha")
+    assert r["status"] == "done"; return f"slept {LONG}s; relay-send returned on running"
 
 @test("multimodal in+out (png + mp4-ish + txt)")
 def _():
@@ -267,9 +280,8 @@ def _():
 
 @test("worker killed after finish before upload ack (re-upload)")
 def _():
-    kill("worker"); tid = send("beta", "hermes", "quick")
-    # simulate: worker gone, task queued; restart worker, it runs; then kill/restart again right after -> no dup
-    worker(); r = wait_result(tid, 40); kill("worker"); worker(); time.sleep(3); expect_wakes(tid, "beta"); return "no duplicate result/wake"
+    tid = send("beta", "hermes", "quick")
+    r = wait_result(tid, 40); kill("worker"); worker(); time.sleep(3); expect_wakes(tid, "beta"); return "no duplicate result/wake"
 
 @test("server restarted mid-task")
 def _():
@@ -294,8 +306,11 @@ def _():
 @test("missing wake config -> one logged error, no retry")
 def _():
     tid = send("gamma", "hermes", "nobody listens"); wait_result(tid, 20); time.sleep(3)
-    assert not wakes_for(tid); n = open(f"{T}/agent.log").read().count(f"not announced"); assert n == 2, n
-    return "2 error lines (started+done), 0 wakes"
+    assert not wakes_for(tid)
+    assert not os.path.exists(os.path.join(RES, tid, ".wake-started"))
+    n = open(f"{T}/agent.log").read().count("not announced"); assert n == 1, n
+    assert "missing" in open(os.path.join(RES, tid, ".wake")).read()
+    return "1 error line (done only), 0 wakes"
 
 @test("primary down -> fallback used (sticky)")
 def _():
@@ -318,13 +333,13 @@ def _():
     assert json.load(open(cf))["mode"] == "primary", "did not switch back after primary healed"
     tid2 = send("alpha", "hermes", "back on primary"); wait_result(tid2, 40); time.sleep(2); expect_wakes(tid2, "alpha")
     log = open(f"{T}/worker.log").read(); assert log.count("connection -> fallback") >= 1
-    return "503 x2 -> fallback; stayed while 503; healed -> primary; started+done each"
+    return "503 x2 -> fallback; stayed while 503; healed -> primary; one done wake each"
 
 @test("box-agent: primary 503 -> fallback, one wake, then switch back")
 def _():
     alog = f"{T}/agent.log"; n0, p0 = open(alog).read().count("connection -> fallback"), open(alog).read().count("connection -> primary")
     kill("agent"); BROKEN["on"] = True
-    # Leave worker as-is (may be on fallback from prior test); confirm-before-upload still sets started_wake.
+    # Leave worker as-is (may be on fallback from prior test). Confirm still clears the claim lease.
     agent(RELAY_URL=f"http://127.0.0.1:{FLAKY}", RELAY_FALLBACK_URL=URL, RELAY_FAIL_THRESHOLD="2", RELAY_COOLDOWN_S="4")
     end = time.time() + 30
     while time.time() < end and open(alog).read().count("connection -> fallback") == n0: time.sleep(0.3)
@@ -336,13 +351,135 @@ def _():
     assert open(alog).read().count("connection -> primary") == p0 + 1, "agent did not switch back"
     tid2 = send("beta", "hermes", "agent back on primary"); wait_result(tid2, 40); time.sleep(2); expect_wakes(tid2, "beta")
     assert open(alog).read().count("connection -> fallback") == n0 + 1, "flip-flopped"
-    return "2x503 -> fallback; started+done wakes; healed -> primary"
+    return "2x503 -> fallback; one done wake; healed -> primary"
 
 @test("relay-send: primary down -> enqueues via RELAY_FALLBACK_URL")
 def _():
     e = dict(ENV, RELAY_URL=f"http://127.0.0.1:{DEAD}", RELAY_FALLBACK_URL=URL)
-    tid = subprocess.run([f"{ROOT}/bin/relay-send", "beta", "hermes", "send via fallback"], env=e, capture_output=True, text=True, check=True).stdout.strip()
-    wait_result(tid, 40); time.sleep(2); expect_wakes(tid, "beta"); return "enqueued on fallback, started+done"
+    p = subprocess.run([f"{ROOT}/bin/relay-send", "beta", "hermes", "send via fallback"], env=e, capture_output=True, text=True)
+    assert p.returncode == 0 and "accepted" in p.stderr, (p.returncode, p.stderr)
+    tid = p.stdout.strip()
+    wait_result(tid, 40); time.sleep(2); expect_wakes(tid, "beta"); return "enqueued on fallback, one done wake"
+
+@test("relay-send: enqueue failure exits 1")
+def _():
+    e = dict(ENV, RELAY_URL=f"http://127.0.0.1:{DEAD}")
+    e.pop("RELAY_FALLBACK_URL", None)
+    p = subprocess.run([f"{ROOT}/bin/relay-send", "alpha", "hermes", "no server"], env=e, capture_output=True, text=True)
+    assert p.returncode == 1, (p.returncode, p.stderr, p.stdout)
+    assert p.stdout.strip() == ""
+    assert "enqueue failed" in p.stderr
+    return "exit 1, no task id"
+
+@test("relay-send: accepted wait timeout exits 2")
+def _():
+    kill("worker"); kill("agent")
+    try:
+        tid = "not-accepted-1"
+        e = dict(ENV, RELAY_STARTED_WAIT_S="0.5")
+        t0 = time.time()
+        p = subprocess.run([f"{ROOT}/bin/relay-send", "alpha", "hermes", "queued only", "--id", tid],
+                           env=e, capture_output=True, text=True)
+        assert time.time() - t0 < 5, time.time() - t0
+        assert p.returncode == 2, (p.returncode, p.stderr, p.stdout)
+        assert p.stdout.strip() == tid and "\n" not in p.stdout.strip()
+        assert "已入队、尚未接单" in p.stderr and "accepted" not in p.stderr, p.stderr
+        task = json.loads(api("GET", f"/tasks/{tid}")[1])["task"]
+        assert task["state"] in ("queued", "claimed"), task
+        st, raw, _ = api("POST", f"/tasks/{tid}/result", json.dumps({
+            "status": "failed", "summary": "test closed"}).encode(), "application/json")
+        assert st == 200, (st, raw)
+        assert api("POST", f"/results/{tid}/ack", b"{}", "application/json")[0] == 200
+        assert not wakes_for(tid)
+        return "exit 2, id on stdout, 已入队、尚未接单"
+    finally:
+        worker(); agent()
+
+def box_agent_mod():
+    if not hasattr(box_agent_mod, "m"):
+        os.environ["RELAY_URL"] = URL
+        os.environ["RELAY_SECRET_FILE"] = SECRET
+        os.environ["RELAY_RESULTS_DIR"] = RES
+        os.environ["RELAY_WAKE_DIR"] = WAKE
+        import importlib.machinery, importlib.util
+        name, path = "relay_box_agent_under_test", os.path.join(ROOT, "bin", "relay-box-agent")
+        loader = importlib.machinery.SourceFileLoader(name, path)
+        spec = importlib.util.spec_from_loader(name, loader)
+        mod = importlib.util.module_from_spec(spec); loader.exec_module(mod)
+        box_agent_mod.m = mod
+    return box_agent_mod.m
+
+@test("stale started event is acked, not webhooked")
+def _():
+    mod = box_agent_mod()
+    tid = "stale-started-1"
+    n0 = len(WAKES)
+    body = {"id": tid, "sender": "alpha", "status": "started", "summary": "Mac 已接单（hermes）",
+            "tool": "hermes", "files": []}
+    sec = open(SECRET).read().strip()
+    mod.handle(sec, body); mod.handle(sec, body)  # second delivery still does not POST
+    assert len(WAKES) == n0
+    marker = os.path.join(RES, tid, ".wake-started")
+    assert open(marker).read().strip() == "skipped/no-webhook", open(marker).read()
+    return "acked, .wake-started=skipped/no-webhook"
+
+@test("started confirm is queryable and does not block done delivery")
+def _():
+    kill("worker"); kill("agent")
+    try:
+        # Drop anything already finished so this assertion sees only the rows it creates.
+        for _i in range(20):
+            st, raw, _ = api("GET", "/results/next?wait=0")
+            if st == 204:
+                break
+            assert st == 200, (st, raw)
+            got = json.loads(raw)["task"]
+            assert got["status"] in ("done", "failed"), got
+            assert api("POST", f"/results/{got['id']}/ack", b"{}", "application/json")[0] == 200
+        else:
+            raise AssertionError("results queue did not drain")
+        tid = "accept-mark-1"
+        st, raw, _ = api("POST", "/tasks", json.dumps({
+            "id": tid, "sender": "alpha", "tool": "hermes", "prompt": "mark"}).encode(), "application/json")
+        assert st == 201, (st, raw)
+        # /started only moves claimed|running. Claim the row, then confirm through the API.
+        db = sqlite3.connect(os.path.join(T, "data", "relay.db"), timeout=5)
+        db.execute("update tasks set state='claimed', started=? where id=?", (time.time(), tid))
+        db.commit()
+        st, raw, _ = api("POST", f"/tasks/{tid}/started", b"{}", "application/json")
+        assert st == 200, (st, raw)
+        task = json.loads(api("GET", f"/tasks/{tid}")[1])["task"]
+        assert task["state"] == "running", task
+        sw = db.execute("select started_wake, state from tasks where id=?", (tid,)).fetchone()
+        assert sw == (1, "running"), sw
+        st, raw, _ = api("GET", "/results/next?wait=0")
+        assert st == 204, (st, raw)
+        # A legacy pending started wake must not be preferred over an undelivered result.
+        db.execute("update tasks set started_wake=0 where id=?", (tid,))
+        db.commit()
+        other = "accept-done-1"
+        st, raw, _ = api("POST", "/tasks", json.dumps({
+            "id": other, "sender": "beta", "tool": "hermes", "prompt": "done"}).encode(), "application/json")
+        assert st == 201, (st, raw)
+        st, raw, _ = api("POST", f"/tasks/{other}/result", json.dumps({
+            "status": "done", "summary": "finished"}).encode(), "application/json")
+        assert st == 200, (st, raw)
+        st, raw, _ = api("GET", "/results/next?wait=1")
+        assert st == 200, (st, raw)
+        got = json.loads(raw)["task"]
+        assert got["id"] == other and got["status"] == "done", got
+        assert got["status"] != "started"
+        assert api("POST", f"/results/{other}/ack", b"{}", "application/json")[0] == 200
+        st, raw, _ = api("GET", "/results/next?wait=0")
+        assert st == 204, (st, raw)  # legacy started_wake=0 is not delivered
+        st, raw, _ = api("POST", f"/tasks/{other}/started", b"{}", "application/json")
+        assert st == 200, (st, raw)
+        done = json.loads(api("GET", f"/tasks/{other}")[1])["task"]
+        assert done["state"] == "done", done  # confirm must not rewind a finished task
+        db.close()
+        return "started_wake=1; legacy 0 does not block done"
+    finally:
+        worker(); agent()
 
 def load_server():
     import importlib.util
@@ -524,14 +661,13 @@ def _():
         worker(); agent()
 
 for n in list(P): kill(n)
-# Each task that called /started should contribute exactly 2 wakes (started + final).
+# Each confirmed task contributes exactly one final wake (done|failed). No started webhooks.
 # gamma (no wake config) contributes 0. Count by task_id.
-from collections import Counter
 by = {}
 for slug, body, _auth in WAKES:
     by.setdefault(body["task_id"], []).append(body["status"])
-bad = {tid: st for tid, st in by.items() if st != ["started", "done"] and st != ["started", "failed"]}
-ROWS.append(("global: each task started then done|failed once", "PASS" if not bad else "FAIL", "-",
+bad = {tid: st for tid, st in by.items() if st not in (["done"], ["failed"])}
+ROWS.append(("global: each task one final wake, no started webhook", "PASS" if not bad else "FAIL", "-",
              f"{len(WAKES)} wakes / {len(by)} tasks" + (f"; bad={bad}" if bad else "")))
 with open(os.path.join(ROOT, "TESTS.md"), "w") as f:
     f.write(f"# Self-test results\n\nLoopback run on the dev box, {time.strftime('%Y-%m-%d %H:%M %Z')}. "
