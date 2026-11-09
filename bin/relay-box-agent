@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Long-polls the relay for started + finished events; wakes the sender bot each time.
-On status=started: one lightweight wake (no files). On done/failed: download files, write
-result.json, one wake. Dedup via .wake-started / .wake markers (at-most-once per phase).
+"""Long-polls the relay for finished events and wakes the sender bot once (done/failed).
+status=started is not sent to the sender webhook. If one still arrives, ack it and write
+.wake-started as skipped/no-webhook. On done/failed: download files, write result.json,
+one wake. Dedup via .wake (at-most-once).
 Env: RELAY_URL, RELAY_SECRET_FILE, RELAY_RESULTS_DIR (/workspace/relay-results),
 RELAY_WAKE_DIR (/workspace/relay/wake), optional RELAY_FALLBACK_URL (e.g. a Tailscale address),
 RELAY_FAIL_THRESHOLD (3), RELAY_COOLDOWN_S (300). Run under nohup/supervisor; not a cron job."""
@@ -36,12 +37,11 @@ def wake(t, rdir):
 def handle(sec, t):
     rdir = os.path.join(RES, t["id"]); os.makedirs(rdir, exist_ok=True)
     if t.get("status") == "started":
+        # Acceptance is returned by relay-send. Never POST the sender webhook for started.
         marker = os.path.join(rdir, ".wake-started")
         if not os.path.exists(marker):
-            open(marker, "w").write("attempting\n")  # at-most-once: written BEFORE the POST
-            res = wake(t, rdir)
-            open(marker, "w").write(res + "\n")
-            log("delivered", t["id"], "started", "wake:", res)
+            open(marker, "w").write("skipped/no-webhook\n")
+            log("started", t["id"], "skipped/no-webhook")
         CONN.request(sec, "POST", f"/results/{urllib.parse.quote(t['id'])}/ack",
                      b'{"event":"started"}', "application/json")
         return
