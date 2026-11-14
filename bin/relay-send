@@ -1,53 +1,130 @@
 #!/usr/bin/env python3
-"""relay-send <sender-slug> <hermes|deepseek|codex|schwab> '<prompt>' [--file F]... [--id ID]
-Enqueues a task, prints the task id on stdout, then polls GET /tasks/{id} until the worker
-has accepted (state running) or the task is already done/failed. Default wait 45s
-(RELAY_STARTED_WAIT_S). Success: stderr "accepted ...", exit 0. Still unaccepted when the
-wait ends: stderr 已入队、尚未接单, exit 2. Enqueue failure exits 1.
-Env: RELAY_URL, RELAY_SECRET_FILE, optional RELAY_FALLBACK_URL (used once if the primary fails)."""
-import argparse, os, sys, time, urllib.parse, uuid
+"""relay-send <sender-slug> <hermes|deepseek|codex|schwab|selftest> '<prompt>'|- [--prompt-file P] [--file F]... [--id ID]
+
+Enqueues a task, prints the task id on stdout, then polls GET /tasks/{id} until the worker has
+accepted it (state running) or it is already done/failed. Default wait 45s
+(RELAY_STARTED_WAIT_S). Success: stderr "accepted ...", exit 0. Still unaccepted when the wait
+ends: stderr 已入队、尚未接单, exit 2 (the task stays queued). Enqueue failure everywhere: exit 1.
+
+Channels: RELAY_URL (primary) first, then RELAY_FALLBACK_URL (comma-separated). If the primary
+cannot take the task, the next channel is used. If a channel took it but no worker accepted it
+within RELAY_HANDOFF_S (20s), the same task id is also posted to the next reachable channel and
+withdrawn from the first when it is still queued; the Mac worker runs a task id at most once,
+so a copy on two channels cannot run twice.
+
+Attachments: on servers with the "staged" feature the task is created as staging, each file is
+uploaded with chunked, resumable PUTs (sha256 checked by the server), then committed, so large
+files (hundreds of MB) are fine. Old servers get one multipart body, capped at their soft limit
+(16 MiB); larger inputs skip that channel. Env: RELAY_URL, RELAY_SECRET_FILE, RELAY_FALLBACK_URL."""
+import argparse, json, os, sys, time, urllib.error, uuid
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
-from relay.client import Failover, multipart, secret
+from relay.client import endpoints_from_env, multipart, secret
+from relay.net import qseg, sha256_file, upload_file
 
-def started_wait_s():
+def err(*m):
+    print("relay-send:", *m, file=sys.stderr, flush=True)
+
+def fenv(name, default):
     try:
-        return max(0.0, float(os.environ.get("RELAY_STARTED_WAIT_S", "45")))
+        return max(0.0, float(os.environ.get(name, default)))
     except ValueError:
-        return 45.0
+        return float(default)
 
-def poll_accepted(conn, tid, limit):
-    """Short poll until state is running, done, or failed. None means the wait elapsed."""
-    path, deadline = "/tasks/" + urllib.parse.quote(tid, safe=""), time.monotonic() + limit
-    while True:
-        try:
-            st, data = conn.request(secret(), "GET", path, timeout=10)
-            state = data.get("task", {}).get("state") if st == 200 and isinstance(data, dict) else None
-            if state in ("running", "done", "failed"):
-                return state
-        except Exception:
-            pass
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+class Skip(Exception):
+    pass
 
-ap = argparse.ArgumentParser()
-ap.add_argument("slug"); ap.add_argument("tool", choices=["hermes", "deepseek", "codex", "schwab"]); ap.add_argument("prompt")
-ap.add_argument("--file", action="append", default=[]); ap.add_argument("--id")
-a = ap.parse_args()
-tid = a.id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
-body, ct = multipart({"id": tid, "sender": a.slug, "tool": a.tool, "prompt": a.prompt}, a.file)
-try:
-    conn = Failover.from_env(lambda *m: print("relay-send:", *m, file=sys.stderr)); conn.threshold = 1
+def enqueue(ep, tid, a, metas):
+    """Create the task on ep. Returns True when it is queued (or already further along)."""
+    fields = {"id": tid, "sender": a.slug, "tool": a.tool, "prompt": a.prompt}
+    if not a.file:
+        _, j = ep.json("POST", "/tasks", fields, deadline=120)
+        return True
+    if "staged" in ep.capabilities():
+        _, j = ep.json("POST", "/tasks", dict(fields, staged=True, attachments=metas), deadline=120)
+        state = j.get("state")
+        if state in (None, "staging"):
+            for path, m in zip(a.file, metas):
+                t0 = time.time()
+                upload_file(ep, tid, "in", path, m["name"], log=err)
+                err("uploaded", m["name"], m["size"], "bytes", f"{time.time() - t0:.1f}s", "to", ep.name)
+            _, j = ep.json("POST", f"/tasks/{qseg(tid)}/commit", {}, deadline=120)
+        return True
+    total = sum(m["size"] for m in metas)
+    soft = 16 * 1024 * 1024
+    if total > soft:
+        raise Skip(f"{ep.name}: old server, {total} attachment bytes over the 16MiB multipart cap")
+    body, ct = multipart(fields, a.file)
+    ep.call("POST", "/tasks", body, ct, deadline=300)
+    return True
+
+def state_of(ep, tid):
     try:
-        st, _ = conn.request(secret(), "POST", "/tasks", body, ct, timeout=60)
+        _, j = ep.json("GET", "/tasks/" + qseg(tid), deadline=10, stall=10)
+        return j.get("task", {}).get("state")
+    except urllib.error.HTTPError as e:
+        return "missing" if e.code == 404 else None
     except Exception:
-        if conn.mode != "fallback": raise
-        st, _ = conn.request(secret(), "POST", "/tasks", body, ct, timeout=60)  # idempotent by task id
-except Exception as e:
-    sys.exit(f"relay-send: enqueue failed: {e}")
-print(tid, flush=True)
-state = poll_accepted(conn, tid, started_wait_s())
-if state is None:
-    print("relay-send: 已入队、尚未接单", file=sys.stderr)
-    sys.exit(2)
-print(f"relay-send: accepted {tid} state={state}", file=sys.stderr)
+        return None
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("slug"); ap.add_argument("tool", choices=["hermes", "deepseek", "codex", "schwab", "selftest"])
+    ap.add_argument("prompt", nargs="?", help="prompt text; '-' reads it from stdin (or use --prompt-file)")
+    ap.add_argument("--prompt-file", help="read the prompt from this file (no argv size limit)")
+    ap.add_argument("--file", action="append", default=[]); ap.add_argument("--id")
+    a = ap.parse_args()
+    if a.prompt_file:
+        a.prompt = open(a.prompt_file, encoding="utf-8").read()
+    elif a.prompt == "-":
+        a.prompt = sys.stdin.read()
+    elif a.prompt is None:
+        ap.error("a prompt (or '-' or --prompt-file) is required")
+    tid = a.id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
+    metas = [{"name": os.path.basename(p), "size": os.path.getsize(p), "sha256": sha256_file(p)} for p in a.file]
+    try:
+        eps = endpoints_from_env(err)
+    except Exception as e:
+        sys.exit(f"relay-send: enqueue failed: {e}")
+    wait, handoff = fenv("RELAY_STARTED_WAIT_S", 45), fenv("RELAY_HANDOFF_S", 20)
+    posted, last, i = [], None, 0
+
+    def post_next():
+        nonlocal i, last
+        while i < len(eps):
+            ep = eps[i]; i += 1
+            try:
+                enqueue(ep, tid, a, metas); posted.append(ep)
+                if len(posted) > 1:
+                    err("handoff", tid, "->", ep.name)
+                return ep
+            except Exception as e:
+                last = e; err("channel", ep.name, "could not take", tid, "-", type(e).__name__, str(e)[:160])
+        return None
+
+    if not post_next():
+        sys.exit(f"relay-send: enqueue failed: {last}")
+    print(tid, flush=True)
+    start = time.monotonic(); deadline = start + wait; handed = start + handoff
+    while True:
+        for ep in posted:
+            s = state_of(ep, tid)
+            if s in ("running", "done", "failed"):
+                err(f"accepted {tid} state={s} via {ep.name}")
+                return 0
+        now = time.monotonic()
+        if now >= deadline:
+            err("已入队、尚未接单", "(" + ",".join(e.name for e in posted) + ")")
+            return 2
+        if now >= handed and i < len(eps):
+            prev = posted[-1]
+            if post_next():
+                try:
+                    _, j = prev.json("POST", f"/tasks/{qseg(tid)}/withdraw", {}, deadline=10, stall=10)
+                    err("withdraw", tid, "on", prev.name, "->", j.get("state"))
+                except Exception as e:
+                    err("withdraw", tid, "on", prev.name, "not possible:", type(e).__name__)
+            handed = now + handoff
+        time.sleep(min(0.3, max(0.0, deadline - time.monotonic())))
+
+if __name__ == "__main__":
+    sys.exit(main())
