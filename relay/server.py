@@ -218,7 +218,7 @@ class H(BaseHTTPRequestHandler):
 
     def authed(self):
         h = self.headers.get("Authorization", "")
-        ok = h.startswith("Bearer ") and hmac.compare_digest(h[7:].strip().encode(), self.server.secret)
+        ok = h.startswith("Bearer ") and self.server.secrets.accepts(h[7:].strip().encode())
         if not ok:
             self.send(401, {"error": "unauthorized"})
         return ok
@@ -587,14 +587,59 @@ def parse_any(ctype, raw):
         return fields, files
     return {}, []
 
+class Secrets:
+    """RELAY_SECRET_FILE holds one secret per line. Every line is accepted, so a rotation can
+    run with old and new side by side (clients send the first line). The file is re-read
+    when it changes; a broken edit keeps the last good set."""
+    def __init__(self, path):
+        self.path, self.sig, self.keys, self.checked, self.lock = path, None, [], 0.0, threading.Lock()
+        self.reload(strict=True)
+
+    @staticmethod
+    def parse(raw):
+        keys = [l.strip() for l in raw.splitlines() if l.strip()]
+        if not keys or any(len(k) < 16 for k in keys):
+            raise ValueError("secret too short (need >=16 bytes per line)")
+        return keys
+
+    def reload(self, strict=False):
+        try:
+            st = os.stat(self.path)
+        except OSError as e:
+            if strict:
+                sys.exit(str(e))
+            return
+        sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+        if sig == self.sig:
+            return
+        first, self.sig = self.sig is None, sig
+        try:
+            with open(self.path, "rb") as f:
+                keys = self.parse(f.read())
+        except (OSError, ValueError) as e:
+            if strict:
+                sys.exit(str(e))
+            log("secret file not reloaded, keeping", len(self.keys), "key(s):", type(e).__name__)
+            return
+        self.keys = keys
+        if not first:
+            log("secret file reloaded:", len(keys), "accepted key(s)")
+
+    def accepts(self, token):
+        with self.lock:
+            if time.time() - self.checked > 2:
+                self.checked = time.time(); self.reload()
+            keys = list(self.keys)
+        ok = False
+        for k in keys:  # compare against every key; no early exit
+            ok |= hmac.compare_digest(token, k)
+        return ok
+
 def main():
     sf = os.environ.get("RELAY_SECRET_FILE")
     if not sf:
         sys.exit("RELAY_SECRET_FILE is required")
-    with open(sf, "rb") as f:
-        secret = f.read().strip()
-    if len(secret) < 16:
-        sys.exit("secret too short (need >=16 bytes)")
+    secrets = Secrets(sf)
     # Comma-separated RELAY_BIND lets the box listen on localhost (box-agent) and the
     # Tailscale address (Mac worker) without binding 0.0.0.0 on a public/LAN NIC.
     binds = [b.strip() for b in os.environ.get("RELAY_BIND", "127.0.0.1").split(",") if b.strip()]
@@ -604,7 +649,7 @@ def main():
     for b in binds:
         srv = ThreadingHTTPServer((b, port), H)
         srv.daemon_threads = True
-        srv.secret = secret
+        srv.secrets = secrets
         srv.store = store
         servers.append(srv)
         log("mac-relay listening on", *srv.server_address[:2], "soft_body", MAX_SOFT_BODY)

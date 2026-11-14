@@ -369,7 +369,8 @@ def safe_rel(n):
 CFG = json.load(open(sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/.config/mac-relay/worker.json")))
 STATE = os.path.expanduser(CFG["state_dir"]); TASKS = os.path.join(STATE, "tasks")
 os.makedirs(TASKS, exist_ok=True)
-SECRET = open(os.path.expanduser(CFG["secret_file"]), "rb").read().strip().decode()
+SECRET = next((l.strip() for l in open(os.path.expanduser(CFG["secret_file"]), "rb").read().decode().splitlines()
+               if l.strip()), "")  # first line; a rotation may leave "new\nold"
 WORKER = CFG.get("worker_name", "mac")
 SOFT = int(CFG.get("max_soft_file", 16 * 1024 * 1024))
 MIRROR_AFTER = float(CFG.get("mirror_after_s", 60))
