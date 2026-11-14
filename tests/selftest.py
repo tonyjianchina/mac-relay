@@ -882,6 +882,34 @@ def _():
             kill("worker")
         worker(); agent()
 
+@test("secret rotation: every line accepted, file reloaded live, clients send the first line")
+def _():
+    orig = open(SECRET).read()
+    old, new = orig.strip(), "rotated-" + os.urandom(12).hex()
+    def code(tok):
+        try:
+            return api("GET", "/status", headers={"Authorization": "Bearer " + tok})[0]
+        except urllib.error.HTTPError as e:
+            return e.code
+    try:
+        with open(SECRET, "w") as f: f.write(new + "\n" + old + "\n")
+        time.sleep(2.5)
+        assert code(new) == 200 and code(old) == 200, (code(new), code(old))
+        sys.path.insert(0, ROOT); import relay.client as rc
+        assert rc.secret(SECRET) == new
+        with open(SECRET, "w") as f: f.write(new + "\n")
+        time.sleep(2.5)
+        assert code(new) == 200 and code(old) == 401, (code(new), code(old))
+        with open(SECRET, "w") as f: f.write("short\n")  # broken edit keeps the last good keys
+        time.sleep(2.5)
+        assert code(new) == 200, code(new)
+        assert "secret file not reloaded" in open(f"{T}/server.log").read()
+    finally:
+        with open(SECRET, "w") as f: f.write(orig)
+        time.sleep(2.5)
+    assert code(old) == 200
+    return "new+old both 200; old removed -> 401 within 2.5 s, no restart; bad edit ignored"
+
 @test("worker embeds relay/net.py verbatim")
 def _():
     net = open(os.path.join(ROOT, "relay", "net.py")).read().strip()

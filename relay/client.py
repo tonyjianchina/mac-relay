@@ -3,8 +3,9 @@ import json, os, uuid, urllib.parse
 from relay.net import Endpoint
 
 def secret(path=None):
+    """First non-empty line: during a rotation the file may hold "new\\nold"."""
     with open(path or os.environ["RELAY_SECRET_FILE"], "rb") as f:
-        return f.read().strip().decode()
+        return next((l.strip() for l in f.read().decode().splitlines() if l.strip()), "")
 
 def multipart(fields, files):
     b = uuid.uuid4().hex
