@@ -7,9 +7,9 @@ together.
 
 | Component | Config | What it does with several channels |
 |---|---|---|
-| `relay-send` | `RELAY_URL` (primary), `RELAY_FALLBACK_URL` (comma list, in order) | Posts the task to the first channel that accepts the enqueue. If the Mac has not accepted it within `RELAY_HANDOFF_S` (default 20 s), posts the same task id to the next channel and withdraws the first copy if it is still queued. Waits up to `RELAY_STARTED_WAIT_S` (default 45 s) in total, polling every channel it posted to. |
+| `relay-send` | `RELAY_URL` (primary), `RELAY_FALLBACK_URL` (comma list, in order), `RELAY_BIG_BYTES` (default 8 MiB) | Posts the task to the first channel that accepts the enqueue. If the combined `--file` size is over `RELAY_BIG_BYTES`, the public URL in `RELAY_FALLBACK_URL` (first https fallback, or the first fallback if none is https) is tried first; the other channels follow in their original order if that one cannot take it. If the Mac has not accepted it within `RELAY_HANDOFF_S` (default 20 s), posts the same task id to the next channel and withdraws the first copy if it is still queued. Waits up to `RELAY_STARTED_WAIT_S` (default 45 s) in total, polling every channel it posted to. |
 | `relay-box-agent` | same env | Long-polls `/results/next` on every channel at once. A result is delivered (files downloaded, `result.json`, one wake) once per task id, whichever channel it comes from. Copies from other channels are acked only. |
-| Mac worker | `endpoints` in `worker.json` (ordered list, first = primary) | Long-polls `/tasks/next` on every endpoint at once. Returns results to the channel(s) it claimed the task from, primary first. If those fail for `mirror_after_s` (default 60 s), it mirrors the task onto another channel and delivers there. |
+| Mac worker | `endpoints` in `worker.json` (ordered list, first = primary); optional `public_endpoint`, `big_bytes` | Long-polls `/tasks/next` on every endpoint at once. Returns results to the channel(s) it claimed the task from, primary first. If the result files together exceed `big_bytes` (default 8 MiB, or `RELAY_BIG_BYTES`), they go to the public channel first (the first https endpoint, or `public_endpoint` by name or URL) — mirrored there if needed, without waiting for `mirror_after_s`. If the origins fail for `mirror_after_s` (default 60 s), it mirrors the task onto another channel and delivers there. |
 
 Channel state (`channel <name> down: …` / `channel <name> recovered after N s`) is logged once
 per transition. A channel counts as down after a connection error, a timeout, or HTTP 5xx.
@@ -71,7 +71,14 @@ two-entry list.
   never appears under its final name.
 - **Attachments (box to Mac).** On v2 servers `relay-send` creates the task as `staged`, uploads
   each `--file` with the same chunked PUT, then commits; the task is not claimable until every
-  attachment is complete and verified. Old servers get multipart (16 MiB cap).
+  attachment is complete and verified. Old servers get multipart (16 MiB cap). If the combined
+  attachment size is over `RELAY_BIG_BYTES` (default 8 MiB), `relay-send` posts the task to the
+  public fallback URL first so the Mac can download it there instead of over a slow primary path.
+- **Big results (Mac to box).** If the outbox (plus stdout/stderr) is over `big_bytes` (same
+  default), the worker uploads to the public https endpoint first, mirroring the task there when
+  it was claimed on another channel. The box agent already consumes every channel, so it picks
+  the result up there. `public_endpoint` in `worker.json` overrides the https heuristic (used
+  by the loopback selftest, which has no TLS).
 - **Prompts.** `relay-send … -` reads the prompt from stdin, `--prompt-file` from a file. The
   worker passes prompts longer than `stdin_prompt_over[tool]` bytes on stdin (`"-"` as the
   prompt argument) instead of argv.

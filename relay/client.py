@@ -21,6 +21,38 @@ def multipart(fields, files):
     out.append(f"--{b}--\r\n".encode())
     return b"".join(out), f"multipart/form-data; boundary={b}"
 
+DEFAULT_BIG_BYTES = 8 * 1024 * 1024
+
+
+def big_bytes(env=None):
+    """RELAY_BIG_BYTES, default 8 MiB. Attachments or results over this use the public channel first."""
+    try:
+        return max(0, int((env or os.environ).get("RELAY_BIG_BYTES", DEFAULT_BIG_BYTES)))
+    except (TypeError, ValueError):
+        return DEFAULT_BIG_BYTES
+
+
+def is_public_url(url):
+    return (url or "").lower().startswith("https://")
+
+
+def public_endpoint(eps, primary_name="primary"):
+    """The VPS public URL: first https fallback, else the first non-primary endpoint (loopback tests)."""
+    named = [e for e in eps if e.name != primary_name]
+    return next((e for e in named if is_public_url(e.url)), None) or (named[0] if named else None)
+
+
+def order_for_size(eps, total, primary_name="primary", threshold=None):
+    """When total bytes exceed the threshold, try the public channel first; otherwise keep config order."""
+    eps = list(eps)
+    if total <= (big_bytes() if threshold is None else threshold):
+        return eps
+    pub = public_endpoint(eps, primary_name)
+    if not pub:
+        return eps
+    return [pub] + [e for e in eps if e is not pub]
+
+
 def endpoints_from_env(log=None, sec=None):
     """RELAY_URL is the primary channel; RELAY_FALLBACK_URL is a comma-separated list of backups.
     Names: primary, backup, backup2, ... (used in logs)."""

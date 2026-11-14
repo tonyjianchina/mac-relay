@@ -6,19 +6,21 @@ accepted it (state running) or it is already done/failed. Default wait 45s
 (RELAY_STARTED_WAIT_S). Success: stderr "accepted ...", exit 0. Still unaccepted when the wait
 ends: stderr 已入队、尚未接单, exit 2 (the task stays queued). Enqueue failure everywhere: exit 1.
 
-Channels: RELAY_URL (primary) first, then RELAY_FALLBACK_URL (comma-separated). If the primary
-cannot take the task, the next channel is used. If a channel took it but no worker accepted it
-within RELAY_HANDOFF_S (20s), the same task id is also posted to the next reachable channel and
-withdrawn from the first when it is still queued; the Mac worker runs a task id at most once,
-so a copy on two channels cannot run twice.
+Channels: RELAY_URL (primary) first, then RELAY_FALLBACK_URL (comma-separated). If the
+combined --file size is over RELAY_BIG_BYTES (default 8 MiB), the public URL in
+RELAY_FALLBACK_URL is tried first (the first https fallback, or the first fallback if none is
+https). If that channel cannot take the task, the others are tried in the original order. If a
+channel took it but no worker accepted it within RELAY_HANDOFF_S (20s), the same task id is also
+posted to the next reachable channel and withdrawn from the first when it is still queued; the
+Mac worker runs a task id at most once, so a copy on two channels cannot run twice.
 
 Attachments: on servers with the "staged" feature the task is created as staging, each file is
 uploaded with chunked, resumable PUTs (sha256 checked by the server), then committed, so large
 files (hundreds of MB) are fine. Old servers get one multipart body, capped at their soft limit
-(16 MiB); larger inputs skip that channel. Env: RELAY_URL, RELAY_SECRET_FILE, RELAY_FALLBACK_URL."""
+(16 MiB); larger inputs skip that channel. Env: RELAY_URL, RELAY_SECRET_FILE, RELAY_FALLBACK_URL, RELAY_BIG_BYTES."""
 import argparse, json, os, sys, time, urllib.error, uuid
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
-from relay.client import endpoints_from_env, multipart, secret
+from relay.client import big_bytes, endpoints_from_env, multipart, order_for_size, secret
 from relay.net import qseg, sha256_file, upload_file
 
 def err(*m):
@@ -82,9 +84,12 @@ def main():
     tid = a.id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
     metas = [{"name": os.path.basename(p), "size": os.path.getsize(p), "sha256": sha256_file(p)} for p in a.file]
     try:
-        eps = endpoints_from_env(err)
+        eps = order_for_size(endpoints_from_env(err), sum(m["size"] for m in metas))
     except Exception as e:
         sys.exit(f"relay-send: enqueue failed: {e}")
+    total = sum(m["size"] for m in metas)
+    if total > big_bytes() and eps and eps[0].name != "primary":
+        err("big-attach", tid, total, "bytes ->", eps[0].name)
     wait, handoff = fenv("RELAY_STARTED_WAIT_S", 45), fenv("RELAY_HANDOFF_S", 20)
     posted, last, i = [], None, 0
 

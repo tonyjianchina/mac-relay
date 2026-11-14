@@ -631,6 +631,67 @@ def box_agent_mod():
         box_agent_mod.m = mod
     return box_agent_mod.m
 
+@test("order_for_size: big attachments prefer the https fallback")
+def _():
+    import relay.client as rc
+    sec = "x"
+    a = rc.Endpoint("http://127.0.0.1:1", sec, "primary")
+    b = rc.Endpoint("https://relay.example.com/relay", sec, "backup")
+    c = rc.Endpoint("http://127.0.0.1:2", sec, "backup2")
+    prev = os.environ.get("RELAY_BIG_BYTES")
+    try:
+        os.environ.pop("RELAY_BIG_BYTES", None)
+        assert [e.name for e in rc.order_for_size([a, b, c], 100)] == ["primary", "backup", "backup2"]
+        assert [e.name for e in rc.order_for_size([a, b, c], 8 * 1024 * 1024 + 1)] == ["backup", "primary", "backup2"]
+        assert [e.name for e in rc.order_for_size([a, c], 9 * 1024 * 1024)] == ["backup2", "primary"]
+        os.environ["RELAY_BIG_BYTES"] = "50"
+        assert [e.name for e in rc.order_for_size([a, b, c], 51)] == ["backup", "primary", "backup2"]
+        assert rc.big_bytes() == 50
+    finally:
+        if prev is None:
+            os.environ.pop("RELAY_BIG_BYTES", None)
+        else:
+            os.environ["RELAY_BIG_BYTES"] = prev
+    return "https fallback first when big; no-https uses first fallback; small unchanged"
+
+@test("big attachments enqueue on the public/fallback channel first")
+def _():
+    src = os.path.join(T, "bigroute.bin")
+    open(src, "wb").write(os.urandom(200))
+    e = {"RELAY_URL": URL, "RELAY_FALLBACK_URL": URL2, "RELAY_BIG_BYTES": "100"}
+    p = run_send(e, "alpha", "hermes", "copyin please", "--file", src)
+    assert p.returncode == 0, (p.returncode, p.stderr, p.stdout)
+    assert "big-attach" in p.stderr and "-> backup" in p.stderr, p.stderr
+    assert "via backup" in p.stderr, p.stderr
+    tid = p.stdout.strip()
+    r = wait_result(tid, 40); expect_wakes(tid, "alpha")
+    wlog = open(f"{T}/worker.log").read()
+    assert f"claimed {tid} hermes via fallback" in wlog, wlog[-2000:]
+    assert sha_file(os.path.join(RES, tid, "copy-bigroute.bin")) == sha_file(src)
+    return "200-byte file over RELAY_BIG_BYTES=100 enqueued and claimed on backup; 1 wake"
+
+@test("big result uploads to the public channel first")
+def _():
+    kill("worker"); kill("agent")
+    cfg = wcfg(URL, "worker-big.json", state_dir_name="mac-state-big",
+               public_endpoint="fallback", big_bytes=100, fallback=URL2)
+    try:
+        worker(cfg); agent()
+        p = run_send({"RELAY_URL": URL, "RELAY_FALLBACK_URL": URL2}, "alpha", "hermes", "media please")
+        assert p.returncode == 0 and "via primary" in p.stderr, p.stderr
+        tid = p.stdout.strip()
+        wait_log("worker", f"big-result {tid}", 30)
+        wait_log("worker", f"uploaded {tid} done", 40)
+        r = wait_result(tid, 40); expect_wakes(tid, "alpha")
+        wait_log("agent", f"delivered {tid} done via backup", 20)
+        wlog = open(f"{T}/worker.log").read()
+        assert f"big-result {tid}" in wlog and "mirror -> fallback" in wlog
+        assert f"uploaded {tid} done" in wlog and "via fallback" in wlog
+        assert os.path.getsize(os.path.join(RES, tid, "clip.mp4")) > 200_000
+        return "small task claimed on primary; result mirrored to fallback immediately; 1 wake"
+    finally:
+        kill("worker"); worker(); agent()
+
 @test("stale started event is acked, not webhooked")
 def _():
     mod = box_agent_mod()

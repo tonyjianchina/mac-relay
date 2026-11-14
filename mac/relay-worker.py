@@ -11,10 +11,13 @@ At most once: the task directory is the ledger. The first claim of a task id wri
 task.json under a lock; a later claim of the same id from any channel (redelivery, or the
 same task posted to two servers) is confirmed but never run again.
 
-Results go back to the channel(s) the task was claimed from, primary first. If none of them
-accepts the result for `mirror_after_s` (default 60), the worker mirrors the task onto
-another channel (POST /tasks {"mirror":true}) and returns the result there; box agents
-consume every channel and dedupe by task id.
+Results go back to the channel(s) the task was claimed from, primary first. If the result
+files together exceed `big_bytes` (default 8 MiB, or RELAY_BIG_BYTES), they go to the public
+channel first (the first https endpoint, or `public_endpoint` in the config) — the task is
+mirrored there if it was not claimed on that channel. If none of the origins accepts the
+result for `mirror_after_s` (default 60), the worker mirrors the task onto another channel
+(POST /tasks {"mirror":true}) and returns the result there; box agents consume every channel
+and dedupe by task id.
 
 Files: outputs (stdout, stderr, everything under the outbox, recursively, keeping relative
 paths) are uploaded with chunked, resumable PUTs (8 MiB, sha256 checked by the server) on
@@ -396,6 +399,29 @@ def _endpoints():
 EPS = _endpoints()
 BYNAME = {e.name: e for e in EPS}
 LEDGER = threading.Lock()
+
+def _big_bytes():
+    try:
+        return max(0, int(CFG.get("big_bytes", os.environ.get("RELAY_BIG_BYTES", 8 * 1024 * 1024))))
+    except (TypeError, ValueError):
+        return 8 * 1024 * 1024
+
+BIG_BYTES = _big_bytes()
+
+def public_ep():
+    """VPS public channel: CFG public_endpoint (name or URL), else the first https endpoint."""
+    want = CFG.get("public_endpoint")
+    if want:
+        if want in BYNAME:
+            return BYNAME[want]
+        for e in EPS:
+            if e.url.rstrip("/") == str(want).rstrip("/"):
+                return e
+    return next((e for e in EPS if e.url.lower().startswith("https://")), None)
+
+def files_total(files):
+    return sum(os.path.getsize(p) for p, _ in files if os.path.isfile(p))
+
 PROCS, PREP, DELIVERING, NEXT_TRY, FAIL_SINCE = {}, set(), set(), {}, {}
 
 def tdir(tid, *p):
@@ -598,8 +624,33 @@ class Fatal4xx(Exception):
         super().__init__(f"{code} {body[:300]}"); self.ep, self.code, self.body = ep, code, body
 
 def deliver(tid, status, summary, files):
-    """Origins first (healthy ones first); after MIRROR_AFTER of failures, other channels."""
+    """Origins first (healthy ones first); after MIRROR_AFTER of failures, other channels.
+    Results larger than big_bytes go to the public channel first, without waiting."""
     last = None
+    pub = public_ep()
+    if pub and files_total(files) > BIG_BYTES:
+        try:
+            if pub not in origins(tid):
+                log("big-result", tid, files_total(files), "bytes mirror ->", pub.name)
+                mirror(pub, tid); add_origin(tid, pub)
+            else:
+                log("big-result", tid, files_total(files), "bytes ->", pub.name)
+            upload_result(pub, tid, status, summary, files)
+            org = [o for o in origins(tid) if o is not pub]
+            if org:
+                _write(tdir(tid, "closeout.json"), json.dumps({
+                    "eps": [o.name for o in org], "after": time.time() + CLOSEOUT_AFTER,
+                    "status": status, "summary": f"{summary} [result files delivered via {pub.name}]"}))
+            return pub.name
+        except urllib.error.HTTPError as e:
+            body = (getattr(e, "relay_body", "") or "").replace("\n", " ")
+            if 400 <= e.code < 500 and not (e.code == 404 and "unknown task" in body):
+                raise Fatal4xx(pub.name, e.code, body) from e
+            last = e
+            log("big-result", tid, "public failed:", type(e).__name__, str(e)[:200], "- falling back")
+        except Exception as e:
+            last = e
+            log("big-result", tid, "public failed:", type(e).__name__, str(e)[:200], "- falling back")
     org = origins(tid)
     for ep in sorted(org, key=lambda e: not e.healthy()):
         try:
