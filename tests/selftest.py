@@ -494,6 +494,130 @@ def _():
     api("POST", f"/results/{tid}/ack", b"{}", "application/json")
     return "sender hung with the socket open; lock freed after 2s stall; resumed from 1 MiB, sha256 ok"
 
+def _stall_after(nbytes):
+    """Sleep once, on the next read after nbytes have already been handed to the socket."""
+    orig, st = NET._Body.read, {"n": 0, "did": False}
+    def slow(self, k=65536):
+        if not st["did"] and st["n"] >= nbytes:
+            st["did"] = True
+            time.sleep(3.5)  # server RELAY_CHUNK_STALL_S is 2
+        b = orig(self, k)
+        st["n"] += len(b)
+        return b
+    NET._Body.read = slow
+    return orig
+
+@test("400 short body mid-chunk resumes from the kept partial (stall_s=2)")
+def _():
+    """One client chunk, pause after the server has committed >=1 MiB. Then five small
+    chunks completed and the next one paused: resume stays at or past that boundary."""
+    ep = NET.Endpoint(URL, open(SECRET).read().strip(), "short")
+    def once(tid, name, n, chunk, pause_after, floor):
+        assert api("POST", "/tasks", json.dumps({"id": tid, "sender": "alpha", "tool": "hermes",
+                   "prompt": "short", "mirror": True}).encode(), "application/json")[0] == 201
+        path = os.path.join(T, name); fill(path, n); want = sha_file(path)
+        logs, orig = [], _stall_after(pause_after)
+        try:
+            m = NET.upload_file(ep, tid, "out", path, name, chunk=chunk, log=lambda *a: logs.append(a))
+        finally:
+            NET._Body.read = orig
+        assert m["sha256"] == want, m
+        offs = []
+        for a in logs:
+            if a and a[0] == "resume":
+                offs.append(int(str(a[3]).split("/")[0]))
+        if floor is not None:
+            assert offs and min(offs) >= floor and max(offs) < n, (offs, floor, n)
+        got, gn = sha_get(f"/files/{tid}/out/{name}")
+        assert got == want and gn == n, (gn, n)
+        api("POST", f"/results/{tid}/ack", b"{}", "application/json")
+        return offs
+    mid = once("short-mid-1", "mid.bin", 3 * 1024 * 1024, NET.CHUNK_BYTES, 1024 * 1024 + 65536, 1024 * 1024)
+    chunk = 256 * 1024
+    once("short-bound-1", "bound.bin", chunk * 6, chunk, chunk * 5 + 64 * 1024, None)
+    lines = open(f"{T}/server.log").read().splitlines()
+    assert any("short-mid-1" in ln and " 400 " in ln for ln in lines), "mid-chunk stall was not a 400"
+    at = chunk * 5
+    assert any(f"short-bound-1/files/bound.bin" in ln and f"offset={at}" in ln and " 400 " in ln for ln in lines)
+    assert any(f"short-bound-1/files/bound.bin" in ln and f"offset={at}" in ln and " 200 " in ln for ln in lines)
+    return f"mid-chunk kept bytes, resumed from {mid[0]}; sixth chunk 400 at {at} then retried there"
+
+def scripted_upload(responses):
+    """Tiny relay: scripted PUT status per file name. GET /uploads is an empty partial."""
+    hits, p = {}, port()
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def _send(self, code, obj):
+            raw = b"" if obj is None else (obj if isinstance(obj, (bytes, bytearray)) else json.dumps(obj).encode())
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(raw)))
+            if obj is not None and not isinstance(obj, (bytes, bytearray)):
+                self.send_header("Content-Type", "application/json")
+            elif isinstance(obj, (bytes, bytearray)) and obj:
+                self.send_header("Content-Type", "text/plain")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if raw:
+                self.wfile.write(raw)
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/status":
+                return self._send(200, {"ok": True, "version": 2, "features": ["status", "chunked", "relpath"]})
+            if path.startswith("/uploads/"):
+                return self._send(200, {"partial": 0, "complete": False, "size": None, "sha256": None})
+            self._send(404, {"error": "no route"})
+        def do_PUT(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            name = urllib.parse.unquote(self.path.split("?", 1)[0].rstrip("/").split("/")[-1])
+            hits[name] = hits.get(name, 0) + 1
+            code, obj = responses[name][min(hits[name] - 1, len(responses[name]) - 1)]
+            self._send(code, obj)
+        def log_message(self, *a):
+            pass
+    threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", p), H).serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{p}", hits
+
+@test("malformed 400 is fatal; short body with no progress stops; a higher partial resumes")
+def _():
+    responses = {
+        "bad.bin": [(400, {"error": "bad name"})],
+        "off.bin": [(400, {"error": "bad offset/total"})],
+        "plain.bin": [(400, {"error": "short body"})],
+        "neg.bin": [(400, {"error": "short body", "partial": -1})],
+        "bool.bin": [(400, {"error": "short body", "partial": True})],
+        "str.bin": [(400, {"error": "short body", "partial": "6"})],
+        "huge.bin": [(400, {"error": "short body", "partial": 10 ** 9})],
+        "junk.bin": [(400, b"not-json")],
+        "zero.bin": [(400, {"error": "short body", "partial": 0})],
+        "grow.bin": [(400, {"error": "short body", "partial": 10}),
+                     (200, {"partial": 32, "complete": True})],
+    }
+    url, hits = scripted_upload(responses)
+    ep = NET.Endpoint(url, "k" * 16, "script")
+    path = os.path.join(T, "script.bin"); open(path, "wb").write(b"abcdefghij" * 3 + b"12")  # 32 bytes
+    fatal = []
+    for name in ("bad.bin", "off.bin", "plain.bin", "neg.bin", "bool.bin", "str.bin", "huge.bin", "junk.bin"):
+        try:
+            NET.upload_file(ep, "script-1", "out", path, name)
+            raise AssertionError(name + " was accepted")
+        except urllib.error.HTTPError as e:
+            fatal.append((name, e.code, hits[name]))
+            assert e.code == 400 and hits[name] == 1, (name, e.code, hits[name], getattr(e, "relay_body", "")[:80])
+        except NET.Mismatch:
+            raise
+    try:
+        NET.upload_file(ep, "script-1", "out", path, "zero.bin")
+        raise AssertionError("no-progress short body ran to completion")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400 and hits["zero.bin"] == 1 + NET._SHORT_STALLS, (hits["zero.bin"], e.relay_body)
+    logs = []
+    m = NET.upload_file(ep, "script-1", "out", path, "grow.bin", log=lambda *a: logs.append(a))
+    assert m["size"] == 32 and hits["grow.bin"] == 2, hits["grow.bin"]
+    assert any(a[0] == "resume" and str(a[3]).startswith("10/") for a in logs), logs
+    return f"{len(fatal)} malformed 400s raised on the first PUT; zero.bin stopped at {hits['zero.bin']}; grow resumed at 10"
+
 @test("Range download resumes; wrong bytes fail the sha256 check and never appear")
 def _():
     tid, n = "chunk-1", 20 * 1024 * 1024 + 123
@@ -691,6 +815,244 @@ def _():
         return "small task claimed on primary; result mirrored to fallback immediately; 1 wake"
     finally:
         kill("worker"); worker(); agent()
+
+def _forward(target, rec):
+    """Loopback alias in front of one relay. Records method, path, and Range."""
+    p = port()
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def _go(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n else None
+            rec.append((self.command, self.path, self.headers.get("Range")))
+            hdrs = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "connection", "content-length")}
+            r = urllib.request.Request(target + self.path, data=body, method=self.command, headers=hdrs)
+            try:
+                with OPENER.open(r, timeout=70) as x:
+                    st, d, ct = x.status, x.read(), x.headers.get("Content-Type")
+            except urllib.error.HTTPError as e:
+                st, d, ct = e.code, e.read(), e.headers.get("Content-Type")
+            self.send_response(st)
+            self.send_header("Content-Length", str(len(d)))
+            if ct:
+                self.send_header("Content-Type", ct)
+            self.end_headers()
+            self.wfile.write(d)
+        do_GET = do_POST = do_PUT = _go
+        def log_message(self, *a):
+            pass
+    threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", p), H).serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{p}"
+
+def sha_file_bytes(b):
+    return hashlib.sha256(b).hexdigest()
+
+def _hit_server(base, tid, name, body):
+    assert api_at(base, "POST", "/tasks", json.dumps({
+        "id": tid, "sender": "alpha", "tool": "hermes", "prompt": "dl", "mirror": True}).encode(),
+        "application/json")[0] == 201, tid
+    st, raw, _ = api_at(base, "PUT", f"/tasks/{tid}/files/{name}?kind=out", body, "application/octet-stream")
+    assert st == 200, (tid, st, raw[:120])
+
+@test("large result prefers the public alias when it has the same files; ack stays on the event")
+def _():
+    vp = port()
+    spawn("vpsdl", [sys.executable, f"{ROOT}/relay/server.py"], RELAY_PORT=str(vp),
+          RELAY_DATA_DIR=os.path.join(T, "data-vpsdl"))
+    time.sleep(0.5)
+    base = f"http://127.0.0.1:{vp}"
+    pub_hits, ts_hits, quiet_hits, lie_hits = [], [], [], []
+    pub = _forward(base, pub_hits)
+    ts = _forward(base, ts_hits)
+    qp = port()
+    class Quiet(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def _no(self):
+            quiet_hits.append((self.command, self.path.split("?", 1)[0]))
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            self.send_response(404); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"{}")
+        do_GET = do_POST = do_PUT = _no
+        def log_message(self, *a):
+            pass
+    threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", qp), Quiet).serve_forever, daemon=True).start()
+    lp = port()
+    class Lie(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def do_GET(self):
+            lie_hits.append(self.path.split("?", 1)[0])
+            path = lie_hits[-1]
+            if path.startswith("/uploads/"):
+                obj = {"partial": 0, "complete": True, "size": 1, "sha256": "ab" * 32}
+            else:
+                obj = {"error": "not the file"}
+            raw = json.dumps(obj).encode()
+            self.send_response(200 if path.startswith("/uploads/") else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+        def log_message(self, *a):
+            pass
+    threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", lp), Lie).serve_forever, daemon=True).start()
+    blob = b"R" * (256 * 1024)
+    _hit_server(base, "bigdl-alias-1", "blob.bin", blob)
+    small = b"xyz"
+    _hit_server(base, "smalldl-alias-1", "s.bin", small)
+    other = b"Q" * (64 * 1024)
+    _hit_server(base, "bigdl-other-1", "o.bin", other)
+    sec = open(SECRET).read().strip()
+    mod = box_agent_mod()
+    old_eps, prev = list(mod.EPS), os.environ.get("RELAY_BIG_BYTES")
+    os.environ["RELAY_BIG_BYTES"] = "1000"
+    try:
+        mod.EPS = [NET.Endpoint(f"http://127.0.0.1:{qp}", sec, "primary"),
+                   NET.Endpoint(pub, sec, "backup"),
+                   NET.Endpoint(ts, sec, "backup2")]
+        sha = sha_file_bytes(blob)
+        body = {"id": "bigdl-alias-1", "sender": "alpha", "tool": "hermes", "status": "done",
+                "summary": "alias", "files": ["blob.bin"],
+                "files_meta": [{"name": "blob.bin", "size": len(blob), "sha256": sha}]}
+        os.makedirs(os.path.join(RES, "bigdl-alias-1"), exist_ok=True)
+        with open(os.path.join(RES, "bigdl-alias-1", "blob.bin.partial"), "wb") as f:
+            f.write(blob[:4096])
+        mod.handle(sec, body, mod.EPS[2])  # event is the tailnet alias
+        got = os.path.join(RES, "bigdl-alias-1", "blob.bin")
+        assert sha_file(got) == sha and not os.path.exists(got + ".partial")
+        assert any(m == "GET" and "/files/" in path and rng == "bytes=4096-" for m, path, rng in pub_hits), pub_hits
+        assert not any("/files/" in path for _, path, _ in ts_hits), ts_hits
+        assert any(m == "POST" and path.startswith("/results/bigdl-alias-1/ack") for m, path, _ in ts_hits), ts_hits
+        assert not any(m == "POST" and "/ack" in path for m, path, _ in pub_hits), pub_hits
+        assert quiet_hits == [], quiet_hits
+        expect_wakes("bigdl-alias-1", "alpha")
+        nget = sum(1 for m, path, _ in pub_hits if m == "GET" and "/files/" in path)
+        mod.handle(sec, body, mod.EPS[1])  # duplicate offered on the public alias
+        assert sum(1 for m, path, _ in pub_hits if m == "GET" and "/files/" in path) == nget
+        assert any(m == "POST" and "/results/bigdl-alias-1/ack" in path for m, path, _ in pub_hits)
+        expect_wakes("bigdl-alias-1", "alpha")
+        ts_before = len(ts_hits)
+        pub_before = len(pub_hits)
+        sbody = {"id": "smalldl-alias-1", "sender": "alpha", "tool": "hermes", "status": "done",
+                 "summary": "small", "files": ["s.bin"],
+                 "files_meta": [{"name": "s.bin", "size": len(small), "sha256": sha_file_bytes(small)}]}
+        mod.handle(sec, sbody, mod.EPS[2])
+        assert sha_file(os.path.join(RES, "smalldl-alias-1", "s.bin")) == sha_file_bytes(small)
+        new_ts = ts_hits[ts_before:]
+        new_pub = pub_hits[pub_before:]
+        assert any(m == "GET" and "/files/" in path for m, path, _ in new_ts), new_ts
+        assert not any("/files/" in path or "/uploads/" in path for _, path, _ in new_pub), new_pub
+        expect_wakes("smalldl-alias-1", "alpha")
+        # A different server advertising the same name with a different sha is not a source.
+        mod.EPS = [NET.Endpoint(base, sec, "primary"), NET.Endpoint(f"http://127.0.0.1:{lp}", sec, "backup")]
+        obody = {"id": "bigdl-other-1", "sender": "alpha", "tool": "hermes", "status": "done",
+                 "summary": "other", "files": ["o.bin"],
+                 "files_meta": [{"name": "o.bin", "size": len(other), "sha256": sha_file_bytes(other)}]}
+        mod.handle(sec, obody, mod.EPS[0])
+        assert sha_file(os.path.join(RES, "bigdl-other-1", "o.bin")) == sha_file_bytes(other)
+        assert any(p.startswith("/uploads/") for p in lie_hits), lie_hits
+        assert not any(p.startswith("/files/") for p in lie_hits), lie_hits
+        expect_wakes("bigdl-other-1", "alpha")
+        # https is the public endpoint, but it is down: do not assume it shares the files.
+        dead = port()  # nothing listens; https so it is the public endpoint, and it has no files
+        mod.EPS = [NET.Endpoint(f"http://127.0.0.1:{qp}", sec, "primary"),
+                   NET.Endpoint(f"https://127.0.0.1:{dead}/relay", sec, "backup"),
+                   NET.Endpoint(base, sec, "backup2")]
+        quiet_hits.clear()
+        hid = "bigdl-https-1"
+        _hit_server(base, hid, "h.bin", other)
+        hbody = {"id": hid, "sender": "alpha", "tool": "hermes", "status": "done", "summary": "https",
+                 "files": ["h.bin"], "files_meta": [{"name": "h.bin", "size": len(other), "sha256": sha_file_bytes(other)}]}
+        mod.handle(sec, hbody, mod.EPS[2])
+        assert sha_file(os.path.join(RES, hid, "h.bin")) == sha_file_bytes(other)
+        assert quiet_hits == [], quiet_hits
+        expect_wakes(hid, "alpha")
+        return "public alias served the Range download; tailnet acked; duplicate did not re-fetch; small stayed on the event; wrong sha and dead https were not used"
+    finally:
+        mod.EPS = old_eps
+        if prev is None:
+            os.environ.pop("RELAY_BIG_BYTES", None)
+        else:
+            os.environ["RELAY_BIG_BYTES"] = prev
+        kill("vpsdl")
+
+@test("public short-body gives up and origin delivers; abandoned public row is closed out")
+def _():
+    kill("worker"); kill("agent")
+    sp = port()
+    puts, results = {}, []
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def _send(self, code, obj=None):
+            raw = b"" if obj is None else json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(raw)))
+            if obj is not None:
+                self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if raw:
+                self.wfile.write(raw)
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path in ("/health", "/status"):
+                return self._send(200, {"ok": True, "version": 2, "features": ["status", "chunked", "relpath", "mirror"]})
+            if path.startswith("/uploads/"):
+                return self._send(200, {"partial": 0, "complete": False, "size": None, "sha256": None})
+            if path == "/tasks/next":
+                time.sleep(0.5); return self._send(204)
+            self._send(404, {"error": "no route"})
+        def do_PUT(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            name = urllib.parse.unquote(self.path.split("?", 1)[0].rstrip("/").split("/")[-1])
+            puts[name] = puts.get(name, 0) + 1
+            self._send(400, {"error": "short body", "partial": 0})
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n else b""
+            path = self.path.split("?", 1)[0]
+            if path == "/tasks":
+                return self._send(201, {"id": "x", "state": "running"})
+            if path.endswith("/result"):
+                results.append(json.loads(raw or b"{}")); return self._send(200, {"id": "x"})
+            if path.endswith("/started"):
+                return self._send(200, {"id": "x"})
+            self._send(404, {"error": "no route"})
+        def log_message(self, *a):
+            pass
+    threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", sp), H).serve_forever, daemon=True).start()
+    cfg = wcfg(URL, "worker-close.json", state_dir_name="mac-state-close",
+               public_endpoint="fallback", big_bytes=100, fallback=f"http://127.0.0.1:{sp}")
+    try:
+        worker(cfg); agent()
+        p = run_send({"RELAY_URL": URL}, "alpha", "hermes", "media please")
+        assert p.returncode == 0 and "via primary" in p.stderr, p.stderr
+        tid = p.stdout.strip()
+        wait_log("worker", f"uploaded {tid} done", 40)
+        r = wait_result(tid, 40); expect_wakes(tid, "alpha")
+        assert os.path.getsize(os.path.join(RES, tid, "clip.mp4")) > 200_000
+        assert puts.get("stdout.txt") == 1 + NET._SHORT_STALLS, puts
+        assert max(puts.values()) <= 1 + NET._SHORT_STALLS, puts
+        wlog = open(f"{T}/worker.log").read()
+        assert any(f"big-result {tid}" in ln and "public failed:" in ln and "HTTPError" in ln and " 400 " in ln
+                   for ln in wlog.splitlines()), wlog[-1500:]
+        assert f"uploaded {tid} done" in wlog and "via primary" in wlog
+        assert f"upload error {tid}" not in wlog
+        root = os.path.join(T, "mac-state-close", "tasks", tid)
+        assert not os.path.exists(os.path.join(root, "quarantine"))
+        assert not os.path.exists(os.path.join(root, "upload-4xx"))
+        wait_log("worker", f"closeout {tid} on fallback", 20)
+        assert f"closeout {tid} on primary" not in open(f"{T}/worker.log").read()
+        assert results and all(item.get("files") == [] for item in results), results
+        task = json.loads(api("GET", f"/tasks/{tid}")[1])["task"]
+        assert task["state"] == "done" and task["files"], task
+        expect_wakes(tid, "alpha")
+        return f"public stopped after {puts.get('stdout.txt')} short bodies; origin kept the files; public closeout had no files"
+    finally:
+        if P.get("worker") and P["worker"].poll() is None:
+            kill("worker")
+        kill("agent")
+        worker(); agent()
 
 @test("stale started event is acked, not webhooked")
 def _():
