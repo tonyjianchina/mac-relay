@@ -616,6 +616,254 @@ def _():
     api("POST", f"/results/{tid}/ack", b"{}", "application/json")
     return f"localhost TLS stall resumed from {offs[0]}"
 
+def _localhost_cert():
+    cert, key = os.path.join(T, "chunk-tls.crt"), os.path.join(T, "chunk-tls.key")
+    if not os.path.exists(cert):
+        subprocess.check_call(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes",
+                               "-keyout", key, "-out", cert, "-subj", "/CN=localhost",
+                               "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return cert, key
+
+def _stream_proxy(upstream_port, tls_ctx=None):
+    """One accept loop. Optionally TLS. Streams each request to upstream and the response back.
+    Upstream connections are reused (keep-alive), the way a reverse proxy does."""
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", 0)); ls.listen(32)
+    port = ls.getsockname()[1]
+    up = {"s": None}
+    def headers(f):
+        line = f.readline()
+        if not line:
+            return None, {}
+        hdrs = {}
+        while True:
+            h = f.readline()
+            if h in (b"\r\n", b"\n", b""):
+                break
+            k, v = h.decode("iso-8859-1").split(":", 1)
+            hdrs[k.lower()] = v.strip()
+        return line, hdrs
+    def upstream():
+        if up["s"] is None:
+            up["s"] = socket.create_connection(("127.0.0.1", upstream_port))
+        return up["s"]
+    def handle(raw):
+        c = tls_ctx.wrap_socket(raw, server_side=True) if tls_ctx else raw
+        f = c.makefile("rb")
+        try:
+            while True:
+                line, hdrs = headers(f)
+                if not line:
+                    break
+                n = int(hdrs.get("content-length", "0") or 0)
+                u = upstream()
+                u.sendall(line)
+                for k, v in hdrs.items():
+                    if k != "connection":
+                        u.sendall(f"{k}: {v}\r\n".encode())
+                u.sendall(b"Connection: keep-alive\r\n\r\n")
+                left = n
+                while left:
+                    b = f.read(min(65536, left))
+                    if not b:
+                        break
+                    u.sendall(b); left -= len(b)
+                uf = u.makefile("rb")
+                sl, sh = headers(uf)
+                if not sl:
+                    break
+                un = int(sh.get("content-length", "0") or 0)
+                body = uf.read(un) if un else b""
+                c.sendall(sl)
+                for k, v in sh.items():
+                    if k != "connection":
+                        c.sendall(f"{k}: {v}\r\n".encode())
+                c.sendall(b"Connection: close\r\n\r\n" + body)
+                if (hdrs.get("connection") or "").lower() == "close":
+                    break
+        except OSError:
+            up["s"] = None
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+    def loop():
+        while True:
+            c, _ = ls.accept()
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
+    return port
+
+@test("two full 8MiB chunks complete over TLS and a keep-alive proxy")
+def _():
+    cert, key = _localhost_cert()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+    hp = _stream_proxy(PORT)
+    tp = _stream_proxy(PORT, ctx)
+    trust = ssl.create_default_context(); trust.load_verify_locations(cert)
+    old = ssl._create_default_https_context
+    ssl._create_default_https_context = lambda: trust
+    try:
+        def run(label, url, nbytes):
+            tid = "chunks-" + label
+            assert api("POST", "/tasks", json.dumps({"id": tid, "sender": "alpha", "tool": "hermes",
+                       "prompt": "chunks", "mirror": True}).encode(), "application/json")[0] == 201
+            path = os.path.join(T, tid + ".bin"); fill(path, nbytes)
+            ep = NET.Endpoint(url, open(SECRET).read().strip(), label)
+            m = NET.upload_file(ep, tid, "out", path, "f.bin", stall=30)
+            assert m["sha256"] == sha_file(path) and m["size"] == nbytes
+            api("POST", f"/results/{tid}/ack", b"{}", "application/json")
+        run("p16", f"http://127.0.0.1:{hp}", 16 * 1024 * 1024)   # second chunk is a full 8MiB and the tail
+        run("p17", f"http://127.0.0.1:{hp}", 17 * 1024 * 1024)   # second chunk is a full 8MiB and not the tail
+        run("t17", f"https://127.0.0.1:{tp}", 17 * 1024 * 1024)
+        lines = open(f"{T}/server.log").read().splitlines()
+        assert any("chunks-p17" in ln and "offset=8388608" in ln and " 200 " in ln for ln in lines)
+        assert any("chunks-t17" in ln and "offset=8388608" in ln and " 200 " in ln for ln in lines)
+        return "16MiB and 17MiB via keep-alive proxy; 17MiB via TLS; second full chunk stored"
+    finally:
+        ssl._create_default_https_context = old
+
+@test("full chunk answered early with 409 is resumed; persistent busy stops")
+def _():
+    cert, key = _localhost_cert()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+    state = {"puts": 0}
+    def reply(c, code, obj, close=True):
+        raw = json.dumps(obj).encode()
+        c.sendall(f"HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {len(raw)}\r\n"
+                  f"Connection: {'close' if close else 'keep-alive'}\r\n\r\n".encode() + raw)
+        if close:
+            c.close()
+    def one(raw):
+        try:
+            c = ctx.wrap_socket(raw, server_side=True)
+        except OSError:
+            raw.close(); return
+        f = c.makefile("rb")
+        try:
+            line = f.readline()
+            if not line:
+                return
+            hdrs = {}
+            while True:
+                h = f.readline()
+                if h in (b"\r\n", b"\n", b""):
+                    break
+                k, v = h.decode().split(":", 1); hdrs[k.lower()] = v.strip()
+            cl = int(hdrs.get("content-length") or 0)
+            path = line.decode().split(" ", 2)[1]
+            if path.startswith("/status"):
+                return reply(c, 200, {"features": ["chunked", "status"]})
+            if path.startswith("/uploads/"):
+                done = state["puts"] >= 3
+                return reply(c, 200, {"partial": 0 if state["puts"] == 0 else 8 * 1024 * 1024,
+                                      "complete": done, "size": 16 * 1024 * 1024 if done else None,
+                                      "sha256": None})
+            if "offset=0" in path:
+                got = 0
+                while got < cl:
+                    b = f.read(min(65536, cl - got))
+                    if not b:
+                        break
+                    got += len(b)
+                state["puts"] += 1
+                return reply(c, 200, {"partial": got, "complete": False})
+            state["puts"] += 1
+            if state["puts"] == 2:
+                # Answer and stop reading. An 8MiB blocking send must not wait out the stall.
+                reply(c, 409, {"busy": True, "partial": 8 * 1024 * 1024}, close=False)
+                time.sleep(30)
+                return
+            got = 0
+            while got < cl:
+                b = f.read(min(65536, cl - got))
+                if not b:
+                    break
+                got += len(b)
+            reply(c, 200, {"partial": 16 * 1024 * 1024, "complete": True})
+        except OSError:
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+    ls = socket.socket(); ls.bind(("127.0.0.1", 0)); ls.listen(16); sp = ls.getsockname()[1]
+    def loop():
+        while True:
+            c, _ = ls.accept()
+            threading.Thread(target=one, args=(c,), daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
+    # always-busy listener
+    busy_n = {"n": 0}
+    def busy_one(raw):
+        try:
+            c = ctx.wrap_socket(raw, server_side=True)
+        except OSError:
+            raw.close(); return
+        f = c.makefile("rb")
+        try:
+            line = f.readline()
+            if not line:
+                return
+            hdrs = {}
+            while True:
+                h = f.readline()
+                if h in (b"\r\n", b"\n", b""):
+                    break
+                k, v = h.decode().split(":", 1); hdrs[k.lower()] = v.strip()
+            path = line.decode().split(" ", 2)[1]
+            cl = int(hdrs.get("content-length") or 0)
+            while cl:
+                b = f.read(min(65536, cl))
+                if not b:
+                    break
+                cl -= len(b)
+            if path.startswith("/status"):
+                return reply(c, 200, {"features": ["chunked", "status"]})
+            if path.startswith("/uploads/"):
+                return reply(c, 200, {"partial": 0, "complete": False})
+            busy_n["n"] += 1
+            reply(c, 409, {"busy": True, "partial": 0})
+        except OSError:
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+    bl = socket.socket(); bl.bind(("127.0.0.1", 0)); bl.listen(16); bp = bl.getsockname()[1]
+    def bloop():
+        while True:
+            c, _ = bl.accept()
+            threading.Thread(target=busy_one, args=(c,), daemon=True).start()
+    threading.Thread(target=bloop, daemon=True).start()
+    trust = ssl.create_default_context(); trust.load_verify_locations(cert)
+    old = ssl._create_default_https_context
+    ssl._create_default_https_context = lambda: trust
+    try:
+        path = os.path.join(T, "early409.bin"); fill(path, 16 * 1024 * 1024)
+        ep = NET.Endpoint(f"https://127.0.0.1:{sp}", "k" * 16, "early")
+        t0 = time.time()
+        m = NET.upload_file(ep, "early", "out", path, "f.bin", stall=8, log=lambda *a: None)
+        dt = time.time() - t0
+        assert m["size"] == 16 * 1024 * 1024 and dt < 8 and state["puts"] >= 3, (m, round(dt, 2), state)
+        path2 = os.path.join(T, "busy.bin"); open(path2, "wb").write(b"b" * 32)
+        epb = NET.Endpoint(f"https://127.0.0.1:{bp}", "k" * 16, "busy")
+        t0 = time.time()
+        try:
+            NET.upload_file(epb, "busy", "out", path2, "f.bin", stall=8)
+            raise AssertionError("persistent busy completed")
+        except ConnectionError as e:
+            assert "busy" in str(e)
+        assert time.time() - t0 < 8, time.time() - t0
+        assert busy_n["n"] == 1 + NET._BUSY_TRIES, busy_n
+        return f"409 while not reading the 8MiB body resumed in {dt:.2f}s; busy stopped after {busy_n['n']} tries"
+    finally:
+        ssl._create_default_https_context = old
+
 def scripted_upload(responses):
     """Tiny relay: scripted PUT status per file name. GET /uploads is an empty partial."""
     hits, p = {}, port()

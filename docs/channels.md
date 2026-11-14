@@ -67,8 +67,12 @@ two-entry list.
   `RELAY_CHUNK_STALL_S` (default 30 s) and answers `400 {"error":"short body","partial":N}`,
   keeping those bytes. The client resumes from N in the same attempt when N is an integer
   between the offset it just sent and the file size. If N does not move, it retries twice
-  and then gives up on that channel. Any other 400 (`bad name`, `bad offset/total`, or a
-  body that is not that JSON) stays fatal. A resume point that grew since the last attempt
+  and then gives up on that channel. A full 8MiB chunk is larger than a typical TCP window:
+  if the peer answers with 409 or this 400 and stops reading, the client reads that response
+  instead of blocking in the send until the stall timeout, then retries the chunk. A 409 that
+  stays `busy` stops after a few tries and the channel is abandoned. Any other 400 (`bad name`,
+  `bad offset/total`, or a body that is not that JSON) stays fatal. A resume point that grew
+  since the last attempt
   restarts the mirror clock, so a slow but working channel is not abandoned.
 - **Downloads (box agent, worker attachments).** Written to `<name>.partial`, resumed with
   `Range`, checked against the size and sha256 the server recorded, then renamed. A partial file
