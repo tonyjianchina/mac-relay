@@ -55,3 +55,25 @@ Tasks used the deterministic `selftest` tool via `prompt_routes` (no model calls
 | Started wait shorter than acceptance | rt-started-timeout-165219 | PASS | 27 s | `relay-send` exit 2, task still ran, 1 wake |
 | Box VM reboot during a 30 MiB attachment download (staged, chunked upload) | rt-attach30-165219 | PASS | 24 min (incl. ~9 min box down; DERP 30–50 KB/s) | after the stack restart the Mac resumed with `Range` (HTTP 206); sha256 `80560c03…9022d7` equal on the Mac; 1 wake |
 | Worker upgrade in place (3 times) | mac-upgrade-* | PASS | ~80 s each | the running upgrade task survived the restart and was delivered by the new worker |
+
+---
+
+# Size routing: big attachments and results go to the public channel first
+
+Date: 2026-11-14, 22:47–23:57 (UTC+8). Goal: the simplest fix for the slow box↔Mac DERP path (~35 KB/s on some hops) by sending large payloads over the VPS public HTTPS channel first (previously measured ~10–16 MB/s). Threshold `RELAY_BIG_BYTES` / `big_bytes`, default 8 MiB. Small tasks unchanged. VPS Caddy, Podcast Reader, and VPS `server.py` were not touched. Temp sender `relaytest` (local webhook); the 14 production wake configs were left in place and restored after the run.
+
+Loopback `python3 tests/selftest.py` was run twice on the branch (after each of the two commits): all tests PASS, including three new ones for size routing.
+
+Mac worker was upgraded in place (backup first, sha256 + py_compile + dry run, rollback on failure, no App install, `worker.json` unchanged). Second upgrade (`mac-bigroute-upgrade-2322`, sha `efd455bd…8096422`) is the code on this branch. It immediately resumed an in-flight 100 MiB download via the public endpoint (`attach … via vps`).
+
+| Scenario | Task | Result | Time | Evidence |
+|---|---|---|---|---|
+| 100 MiB attachment box→Mac (`copyin`) | rt-bigpub-in-2305 | PASS | 32.9 min wall (see notes) | `relay-send` logged `big-attach … -> backup` and uploaded 104,857,600 bytes to the public channel in 35.6 s (~2.8 MB/s). First worker claim used the VPS tailnet URL of the same server (slow). After the second worker upgrade at 23:23:12 the download resumed on public (`via vps`). Mac `manifest.json` and box `copy-a100m.bin` sha256 `08717d18…f1e459` matched the source. 1 wake (http 200); public copy acked only. Box-agent fetched the 100 MiB result via the VPS tailnet channel (`via backup2`) in 762.5 s (~134 KB/s). |
+| ≥50 MiB result Mac→box (`outmb=50`, no inbound file, claimed on primary) | rt-bigpub-out-2341 | PASS | 15.1 min wall | Accepted via primary. Worker mirrored to public and began the upload (stdout + `manifest.json` complete; `rand.bin` reached 41,943,040 bytes = 40 MiB on public, then stalled). Upload to the origin (box) finished: `rand.bin` 52,428,800 bytes, sha256 `77e39cb4…e9d841` equal in the Mac manifest and on the box. Box-agent delivered via primary in 0.1 s. 1 wake (http 200). |
+
+## Notes vs the old ~35 KB/s path
+
+- 100 MiB at 35 KB/s would be about 49 minutes for a single transfer. The box→VPS public upload of the same file took 35.6 s (~80×). After the worker preferred the public URL, the Mac finished the tool run by 23:25:42 (about 2.5 minutes after the resume). The long tail was the box-agent download of the result over the VPS tailnet URL (762.5 s), not the Mac attachment fetch.
+- The 50 MiB result did go to public first, but that upload stalled at a 8 MiB chunk boundary (40 MiB). Existing origin fallback then delivered over the box primary. Correctness and dedup held; the public upload did not finish.
+- Follow-ups (not in this PR): box-agent should prefer the public URL when downloading a large result (it currently uses whichever channel offered the result event). And Mac→VPS public uploads that stall at a chunk boundary should be diagnosed (HTTPS proxy on the Mac is a likely suspect; tailnet uploads of hundreds of MiB have been fast before).
+
