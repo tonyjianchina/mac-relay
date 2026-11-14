@@ -17,7 +17,8 @@ Mac worker runs a task id at most once, so a copy on two channels cannot run twi
 Attachments: on servers with the "staged" feature the task is created as staging, each file is
 uploaded with chunked, resumable PUTs (sha256 checked by the server), then committed, so large
 files (hundreds of MB) are fine. Old servers get one multipart body, capped at their soft limit
-(16 MiB); larger inputs skip that channel. Env: RELAY_URL, RELAY_SECRET_FILE, RELAY_FALLBACK_URL, RELAY_BIG_BYTES."""
+(16 MiB); larger inputs skip that channel. Env: RELAY_URL, RELAY_SECRET_FILE, RELAY_FALLBACK_URL, RELAY_BIG_BYTES, RELAY_CHUNK_BYTES
+(chunked PUT size; public HTTPS defaults to 1MiB, direct URLs to 8MiB)."""
 import argparse, json, os, sys, time, urllib.error, uuid
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 from relay.client import big_bytes, endpoints_from_env, multipart, order_for_size, secret

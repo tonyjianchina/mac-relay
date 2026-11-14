@@ -46,9 +46,12 @@ def log(*a):
 # --- BEGIN mac-relay net (keep identical to the copy in mac/relay-worker.py; tests check) ---
 # Stdlib HTTP for mac-relay clients: hard deadlines, stall detection, chunked resumable
 # upload with sha256, resumable verified download. Shared by box tools and the Mac worker.
-import hashlib, http.client, json, os, select, socket, ssl, threading, time, urllib.error, urllib.parse, urllib.request
+import hashlib, http.client, json, os, socket, threading, time, urllib.error, urllib.parse, urllib.request
 
 CHUNK_BYTES = 8 * 1024 * 1024
+# Public HTTPS is not a tailnet/loopback URL. An 8MiB body there timed out with no HTTP
+# status (live partial stopped at 7MiB). One-mebibyte bodies stay inside a normal window.
+PUBLIC_CHUNK_BYTES = 1024 * 1024
 
 
 def qseg(s):
@@ -61,6 +64,23 @@ def is_direct(url):
     host = (urllib.parse.urlparse(url).hostname or "").rstrip(".").lower()
     return (host.startswith("100.") or host.endswith(".ts.net") or host.startswith("127.")
             or host in ("localhost", "::1"))
+
+
+def chunk_bytes(url=None, env=None):
+    """Bytes per chunked PUT. RELAY_CHUNK_BYTES overrides. Otherwise public URLs use 1MiB
+    and direct URLs keep 8MiB. Clamped to 64KiB..8MiB."""
+    env = os.environ if env is None else env
+    raw = env.get("RELAY_CHUNK_BYTES")
+    if raw not in (None, ""):
+        try:
+            n = int(raw)
+        except ValueError:
+            n = PUBLIC_CHUNK_BYTES
+    elif url and not is_direct(url):
+        n = PUBLIC_CHUNK_BYTES
+    else:
+        n = CHUNK_BYTES
+    return min(CHUNK_BYTES, max(64 * 1024, n))
 
 
 class _Watch:
@@ -136,100 +156,14 @@ def _early_response(exc):
     return None
 
 
-class _PeerAnswered(Exception):
-    """The peer sent an HTTP error before the request body finished."""
-    def __init__(self, status, reason, body):
-        super().__init__(status)
-        self.early_status, self.early_reason, self.early_body = status, reason, body
-
-
 class _EarlyBody:
-    """Send a request body without deadlocking if the peer answers first.
-
-    A full 8MiB chunk does not fit in a typical TCP window. If the server or a
-    proxy replies (409 busy, 400 short body) and stops reading, a blocking
-    send waits until the stall watchdog. Polling for a readable socket lets
-    the HTTP error be handled, and the chunk retried, instead.
-    """
-    def _read_answered(self):
-        sock = self.sock
-        if sock is None:
-            return None
-        try:
-            sock.settimeout(1)
-            resp = self.getresponse()
-            body = resp.read(65536)
-        except Exception:
-            return None
-        if int(resp.status) < 400:
-            return None
-        reason = resp.reason if isinstance(resp.reason, str) else ""
-        return int(resp.status), reason, bytes(body or b"")
-
-    def _send_body(self, body):
-        sock = self.sock
-        if sock is None:
-            raise ConnectionError("no socket")
-        prev = sock.gettimeout()
-        sock.setblocking(False)
-        try:
-            pending = b""
-            while True:
-                if not pending:
-                    pending = body.read(self.blocksize)
-                    if not pending:
-                        return
-                try:
-                    n = sock.send(pending)
-                except ssl.SSLWantReadError:
-                    got = self._read_answered()
-                    if got:
-                        raise _PeerAnswered(*got)
-                    continue
-                except ssl.SSLWantWriteError:
-                    readable, _ = _poll_send(sock)
-                    if readable:
-                        got = self._read_answered()
-                        if got:
-                            raise _PeerAnswered(*got)
-                    continue
-                except BlockingIOError:
-                    readable, _ = _poll_send(sock)
-                    if readable:
-                        got = self._read_answered()
-                        if got:
-                            raise _PeerAnswered(*got)
-                    continue
-                if not n:
-                    raise ConnectionError("upload socket closed")
-                pending = pending[n:]
-        finally:
-            try:
-                sock.settimeout(prev)
-            except OSError:
-                pass
-
+    """If the peer closes mid-body, keep a 4xx that urllib would otherwise drop."""
     def _send_output(self, message_body=None, encode_chunked=False):
         try:
-            # File bodies are polled so an early 4xx is not stuck behind an 8MiB send.
-            if message_body is not None and hasattr(message_body, "read") and not encode_chunked:
-                super()._send_output(None)
-                self._send_body(message_body)
-                return
-            super()._send_output(message_body, encode_chunked=encode_chunked)
-        except _PeerAnswered as e:
-            err = ConnectionError("peer answered before the upload body finished")
-            err.early_status, err.early_reason, err.early_body = e.early_status, e.early_reason, e.early_body
-            raise err from e
+            super()._send_output(message_body, encode_chunked)
         except OSError as e:
             _note_early(self, e)
             raise
-
-
-def _poll_send(sock):
-    """(readable, writable) with a short wait so a stall watchdog can still run."""
-    r, w, _ = select.select([sock], [sock], [], 0.25)
-    return sock in r, sock in w
 
 
 class _HTTPConn(_EarlyBody, http.client.HTTPConnection):
@@ -425,6 +359,9 @@ _SHORT_STALLS = 2
 # 409 busy means the previous request still holds the upload. Retry a few times, then
 # give up so the caller can use another channel instead of looping forever.
 _BUSY_TRIES = 4
+# A transport timeout with no growth of the server partial. Progress is not capped here:
+# the offset only moves forward.
+_TRANSPORT_TRIES = 2
 
 
 def _short_partial(err, size, sent):
@@ -448,12 +385,15 @@ def _short_partial(err, size, sent):
     return p
 
 
-def upload_file(ep, tid, kind, path, name, chunk=CHUNK_BYTES, stall=60, log=None):
+def upload_file(ep, tid, kind, path, name, chunk=None, stall=60, log=None):
     """Upload one file as `name` (may contain '/' on new servers). New servers: chunked PUT
     with offset; resumes from the server's partial size; the server checks sha256 before the
     file becomes visible. A 400 short body whose partial is in range resumes in this attempt.
-    Old servers: one streaming PUT. Returns {"name","size","sha256"}."""
+    A transport timeout re-reads GET /uploads and continues from that partial. Old servers:
+    one streaming PUT. Returns {"name","size","sha256"}."""
     log = log or (lambda *a: None)
+    if chunk is None:
+        chunk = chunk_bytes(ep.url)
     size, sha = os.path.getsize(path), sha256_file(path)
     meta = {"name": name, "size": size, "sha256": sha}
     base = f"/tasks/{qseg(tid)}/files/{qseg(name)}?kind={kind}"
@@ -471,6 +411,7 @@ def upload_file(ep, tid, kind, path, name, chunk=CHUNK_BYTES, stall=60, log=None
         log("resume", tid, name, f"{off}/{size}", "on", ep.name)
     stalls = 0  # consecutive short bodies that did not advance
     busy = 0
+    transport = 0
     with open(path, "rb") as f:
         while True:
             if reset:
@@ -516,9 +457,31 @@ def upload_file(ep, tid, kind, path, name, chunk=CHUNK_BYTES, stall=60, log=None
                 if e.code == 422:
                     raise Mismatch(f"{name}: server sha256 mismatch") from e
                 raise
+            except (TimeoutError, urllib.error.URLError) as e:
+                # No HTTP status. The server may still have kept bytes (live: 7MiB of an 8MiB body).
+                try:
+                    _, s = ep.json("GET", f"/uploads/{qseg(tid)}/{qseg(name)}?kind={kind}",
+                                   deadline=20, stall=15)
+                except Exception:
+                    raise e
+                if s.get("complete") and s.get("size") == size and s.get("sha256") == sha:
+                    return meta
+                try:
+                    p = int(s.get("partial") or 0)
+                except (TypeError, ValueError):
+                    raise e
+                if p > off and p <= size:
+                    off, reset, stalls, busy, transport = p, False, 0, 0, 0
+                    log("resume", tid, name, f"{off}/{size}", "on", ep.name)
+                    continue
+                transport += 1
+                if transport > _TRANSPORT_TRIES:
+                    raise
+                continue
             reset = False
             stalls = 0
             busy = 0
+            transport = 0
             if j.get("complete"):
                 return meta
             off = int(j.get("partial", off + n))

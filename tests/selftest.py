@@ -725,144 +725,80 @@ def _():
     finally:
         ssl._create_default_https_context = old
 
-@test("full chunk answered early with 409 is resumed; persistent busy stops")
+@test("RELAY_CHUNK_BYTES selects the body size; a timed-out chunk resumes from GET /uploads")
 def _():
-    cert, key = _localhost_cert()
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
-    state = {"puts": 0}
-    def reply(c, code, obj, close=True):
-        raw = json.dumps(obj).encode()
-        c.sendall(f"HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {len(raw)}\r\n"
-                  f"Connection: {'close' if close else 'keep-alive'}\r\n\r\n".encode() + raw)
-        if close:
-            c.close()
-    def one(raw):
-        try:
-            c = ctx.wrap_socket(raw, server_side=True)
-        except OSError:
-            raw.close(); return
-        f = c.makefile("rb")
-        try:
-            line = f.readline()
-            if not line:
-                return
-            hdrs = {}
-            while True:
-                h = f.readline()
-                if h in (b"\r\n", b"\n", b""):
-                    break
-                k, v = h.decode().split(":", 1); hdrs[k.lower()] = v.strip()
-            cl = int(hdrs.get("content-length") or 0)
-            path = line.decode().split(" ", 2)[1]
-            if path.startswith("/status"):
-                return reply(c, 200, {"features": ["chunked", "status"]})
+    assert NET.chunk_bytes("http://127.0.0.1:9") == NET.CHUNK_BYTES
+    assert NET.chunk_bytes("https://relay.example/relay") == NET.PUBLIC_CHUNK_BYTES
+    prev = os.environ.get("RELAY_CHUNK_BYTES")
+    os.environ["RELAY_CHUNK_BYTES"] = "262144"
+    try:
+        assert NET.chunk_bytes("https://relay.example/relay") == 262144
+        assert NET.chunk_bytes("http://100.1.2.3:18790") == 262144
+    finally:
+        if prev is None:
+            os.environ.pop("RELAY_CHUNK_BYTES", None)
+        else:
+            os.environ["RELAY_CHUNK_BYTES"] = prev
+    # First 256KiB body is accepted and then the socket goes quiet. Client stall fires with no
+    # HTTP status. GET /uploads reports that partial; the next 256KiB PUT finishes the file.
+    kept = {"n": 0, "quiet": 0}
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def _send(self, code, obj):
+            raw = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(raw)
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/status":
+                return self._send(200, {"features": ["chunked", "status"]})
             if path.startswith("/uploads/"):
-                done = state["puts"] >= 3
-                return reply(c, 200, {"partial": 0 if state["puts"] == 0 else 8 * 1024 * 1024,
-                                      "complete": done, "size": 16 * 1024 * 1024 if done else None,
-                                      "sha256": None})
-            if "offset=0" in path:
+                done = kept["n"] >= 512 * 1024
+                return self._send(200, {"partial": kept["n"], "complete": done,
+                                        "size": 512 * 1024 if done else None,
+                                        "sha256": sha_file(pathf) if done else None})
+            self._send(404, {"error": "no route"})
+        def do_PUT(self):
+            cl = int(self.headers.get("Content-Length") or 0)
+            if kept["quiet"] == 0:
                 got = 0
-                while got < cl:
-                    b = f.read(min(65536, cl - got))
+                while got < min(cl, 256 * 1024):
+                    b = self.rfile.read(min(65536, min(cl, 256 * 1024) - got))
                     if not b:
                         break
                     got += len(b)
-                state["puts"] += 1
-                return reply(c, 200, {"partial": got, "complete": False})
-            state["puts"] += 1
-            if state["puts"] == 2:
-                # Answer and stop reading. An 8MiB blocking send must not wait out the stall.
-                reply(c, 409, {"busy": True, "partial": 8 * 1024 * 1024}, close=False)
-                time.sleep(30)
+                kept["n"] = got
+                kept["quiet"] = 1
+                time.sleep(8)  # client stall=2 closes this socket; no status line
                 return
             got = 0
             while got < cl:
-                b = f.read(min(65536, cl - got))
+                b = self.rfile.read(min(65536, cl - got))
                 if not b:
                     break
                 got += len(b)
-            reply(c, 200, {"partial": 16 * 1024 * 1024, "complete": True})
-        except OSError:
+            kept["n"] += got
+            self._send(200, {"partial": kept["n"], "complete": kept["n"] >= 512 * 1024})
+        def log_message(self, *a):
             pass
-        finally:
-            try:
-                c.close()
-            except OSError:
-                pass
-    ls = socket.socket(); ls.bind(("127.0.0.1", 0)); ls.listen(16); sp = ls.getsockname()[1]
-    def loop():
-        while True:
-            c, _ = ls.accept()
-            threading.Thread(target=one, args=(c,), daemon=True).start()
-    threading.Thread(target=loop, daemon=True).start()
-    # always-busy listener
-    busy_n = {"n": 0}
-    def busy_one(raw):
-        try:
-            c = ctx.wrap_socket(raw, server_side=True)
-        except OSError:
-            raw.close(); return
-        f = c.makefile("rb")
-        try:
-            line = f.readline()
-            if not line:
-                return
-            hdrs = {}
-            while True:
-                h = f.readline()
-                if h in (b"\r\n", b"\n", b""):
-                    break
-                k, v = h.decode().split(":", 1); hdrs[k.lower()] = v.strip()
-            path = line.decode().split(" ", 2)[1]
-            cl = int(hdrs.get("content-length") or 0)
-            while cl:
-                b = f.read(min(65536, cl))
-                if not b:
-                    break
-                cl -= len(b)
-            if path.startswith("/status"):
-                return reply(c, 200, {"features": ["chunked", "status"]})
-            if path.startswith("/uploads/"):
-                return reply(c, 200, {"partial": 0, "complete": False})
-            busy_n["n"] += 1
-            reply(c, 409, {"busy": True, "partial": 0})
-        except OSError:
-            pass
-        finally:
-            try:
-                c.close()
-            except OSError:
-                pass
-    bl = socket.socket(); bl.bind(("127.0.0.1", 0)); bl.listen(16); bp = bl.getsockname()[1]
-    def bloop():
-        while True:
-            c, _ = bl.accept()
-            threading.Thread(target=busy_one, args=(c,), daemon=True).start()
-    threading.Thread(target=bloop, daemon=True).start()
-    trust = ssl.create_default_context(); trust.load_verify_locations(cert)
-    old = ssl._create_default_https_context
-    ssl._create_default_https_context = lambda: trust
-    try:
-        path = os.path.join(T, "early409.bin"); fill(path, 16 * 1024 * 1024)
-        ep = NET.Endpoint(f"https://127.0.0.1:{sp}", "k" * 16, "early")
-        t0 = time.time()
-        m = NET.upload_file(ep, "early", "out", path, "f.bin", stall=8, log=lambda *a: None)
-        dt = time.time() - t0
-        assert m["size"] == 16 * 1024 * 1024 and dt < 8 and state["puts"] >= 3, (m, round(dt, 2), state)
-        path2 = os.path.join(T, "busy.bin"); open(path2, "wb").write(b"b" * 32)
-        epb = NET.Endpoint(f"https://127.0.0.1:{bp}", "k" * 16, "busy")
-        t0 = time.time()
-        try:
-            NET.upload_file(epb, "busy", "out", path2, "f.bin", stall=8)
-            raise AssertionError("persistent busy completed")
-        except ConnectionError as e:
-            assert "busy" in str(e)
-        assert time.time() - t0 < 8, time.time() - t0
-        assert busy_n["n"] == 1 + NET._BUSY_TRIES, busy_n
-        return f"409 while not reading the 8MiB body resumed in {dt:.2f}s; busy stopped after {busy_n['n']} tries"
-    finally:
-        ssl._create_default_https_context = old
+    p = port()
+    threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", p), H).serve_forever, daemon=True).start()
+    pathf = os.path.join(T, "resume-timeout.bin")
+    fill(pathf, 512 * 1024)
+    ep = NET.Endpoint(f"http://127.0.0.1:{p}", "k" * 16, "stall")
+    logs = []
+    t0 = time.time()
+    m = NET.upload_file(ep, "tout", "out", pathf, "f.bin", chunk=256 * 1024, stall=2,
+                        log=lambda *a: logs.append(a))
+    dt = time.time() - t0
+    assert m["sha256"] == sha_file(pathf) and m["size"] == 512 * 1024, m
+    assert kept["n"] == 512 * 1024 and dt < 8, (kept, dt)
+    assert any(a[0] == "resume" and str(a[3]).startswith("262144/") for a in logs), logs
+    return f"256KiB bodies; timeout with no status resumed from {kept['n'] - 256 * 1024} in {dt:.1f}s"
 
 def scripted_upload(responses):
     """Tiny relay: scripted PUT status per file name. GET /uploads is an empty partial."""
