@@ -45,7 +45,7 @@ Mac（`worker.json`）：
 
 - **结果（Mac → box）。** 分块 `PUT …?offset=&total=&sha256=`（8 MiB）。服务器保留 `.upload` 半成品；offset 不对返回 `409 {"partial": n}`；文件对外可见前校验 sha256（不符返回 `422` 并删除半成品）。`GET /uploads/{id}/{name}?kind=` 返回续传点，断线、worker 重启、服务器重启后都能续传。发送方卡住但不断开时，`RELAY_CHUNK_STALL_S`（默认 30 秒）后释放。续传点比上一次大说明通道慢但在工作，会重置镜像计时，不会为它放弃慢通道。
 - **下载（box-agent、worker 附件）。** 先写 `<name>.partial`，用 `Range` 续传，按服务器记录的大小和 sha256 校验后才改名，半成品永远不会以正式文件名出现。
-- **附件（box → Mac）。** v2 服务器上 `relay-send` 先以 `staged` 建任务，逐个分块 PUT `--file`，再 commit；全部附件完整且校验通过前任务不可被认领。旧服务器仍用 multipart（16 MiB 上限）。合计附件超过 `RELAY_BIG_BYTES`（默认 8 MiB）时，`relay-send` 先把任务发到备用列表里的公网地址，让 Mac 从那里下载，而不是走慢的主通道。
+- **附件（box → Mac）。** v2 服务器上 `relay-send` 先以 `staged` 建任务，逐个分块 PUT `--file`，再 commit；全部附件完整且校验通过前任务不可被认领。旧服务器仍用 multipart（16 MiB 上限）。合计附件超过 `RELAY_BIG_BYTES`（默认 8 MiB）时，`relay-send` 先把任务发到备用列表里的公网地址。worker 下载这些附件时也优先走公网 https，即使它是从同一台服务器的另一条 URL（例如 VPS 的 tailnet 地址）接的单；中途切换通道可以从断点续传。
 - **大结果（Mac → box）。** 出箱（加上 stdout/stderr）超过 `big_bytes`（同一默认值）时，worker 先把结果传到公网 https 端点；若任务不是在那条通道上接的，会先镜像过去。box-agent 本来就消费所有通道，会从那里取走结果。`worker.json` 的 `public_endpoint` 可覆盖“选 https”的规则（loopback 自测没有 TLS 时用）。
 - **长 prompt。** `relay-send … -` 从 stdin 读，`--prompt-file` 从文件读。worker 对超过 `stdin_prompt_over[tool]` 字节的 prompt 改走 stdin（prompt 参数为 `"-"`），不放 argv。
 

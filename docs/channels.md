@@ -73,7 +73,9 @@ two-entry list.
   each `--file` with the same chunked PUT, then commits; the task is not claimable until every
   attachment is complete and verified. Old servers get multipart (16 MiB cap). If the combined
   attachment size is over `RELAY_BIG_BYTES` (default 8 MiB), `relay-send` posts the task to the
-  public fallback URL first so the Mac can download it there instead of over a slow primary path.
+  public fallback URL first. The worker also fetches those attachments from the public https
+  endpoint first, even if it claimed the task on another URL of the same server (for example the
+  VPS tailnet address), and can resume a mid-file download there.
 - **Big results (Mac to box).** If the outbox (plus stdout/stderr) is over `big_bytes` (same
   default), the worker uploads to the public https endpoint first, mirroring the task there when
   it was claimed on another channel. The box agent already consumes every channel, so it picks

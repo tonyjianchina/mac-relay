@@ -25,6 +25,9 @@ servers that support it, and one streaming PUT on old servers. Attachments are d
 with Range resume and checked against the sha256 the sender supplied. Every request has a
 hard deadline and a stall watchdog. Acceptance (/started) is confirmed before attachments
 are downloaded, so a large input does not hold the sender's started wait.
+Big attachments are fetched from the public https endpoint first (the same
+`public_endpoint` / first-https rule as big results), so a claim on a slow
+URL of the same server still uses the fast path and can resume mid-file.
 
 One task's upload failure does not stop the others. HTTP 4xx (other than 404 unknown task)
 counts toward upload_4xx_quarantine (default 3): a quarantine marker is written and the files
@@ -422,6 +425,17 @@ def public_ep():
 def files_total(files):
     return sum(os.path.getsize(p) for p, _ in files if os.path.isfile(p))
 
+def attach_sources(tid, total=0):
+    """Download sources: public first when attachments are big or it is already an origin.
+    vps and vps-ts can be the same server; trying the public URL first avoids the slow
+    tailnet path after a claim on the tailnet URL."""
+    org = list(origins(tid))
+    pub = public_ep()
+    candidates = list(org)
+    if pub and pub not in candidates and total > BIG_BYTES:
+        candidates = [pub] + candidates
+    return sorted(candidates, key=lambda e: (not e.healthy(), e is not pub))
+
 PROCS, PREP, DELIVERING, NEXT_TRY, FAIL_SINCE = {}, set(), set(), {}, {}
 
 def tdir(tid, *p):
@@ -502,6 +516,16 @@ def prep(tid):
         inbox = tdir(tid, "in")
         meta = {m.get("name"): m for m in task.get("attachments_meta") or [] if isinstance(m, dict)}
         end, backoff = time.time() + ATTACH_DEADLINE, 2
+        total = 0
+        for n in task.get("attachments") or []:
+            m = meta.get(n, {})
+            try:
+                total += int(m.get("size") or 0)
+            except (TypeError, ValueError):
+                pass
+        srcs = attach_sources(tid, total)
+        if srcs:
+            log("attach", tid, total, "bytes via", ",".join(e.name for e in srcs))
         for n in task.get("attachments") or []:
             rel = safe_rel(n)
             if not rel:
@@ -510,9 +534,10 @@ def prep(tid):
             m = meta.get(n, {})
             while not os.path.exists(dest):
                 err = None
-                for ep in sorted(origins(tid), key=lambda e: not e.healthy()):
+                for ep in srcs:
                     try:
                         download_file(ep, tid, "in", n, dest, m.get("size"), m.get("sha256"))
+                        log("downloaded", tid, n, "via", ep.name)
                         break
                     except Exception as e:
                         err = e
