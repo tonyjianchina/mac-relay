@@ -539,7 +539,7 @@ def _():
 
 @test("long prompt (300 KB) via --prompt-file and worker stdin")
 def _():
-    big = ("长提示 " * 50000)[:100000] + "x" * 200000 + " end"
+    big = ("long-prompt\u00e9 " * 50000)[:100000] + "x" * 200000 + " end"
     pf = os.path.join(T, "prompt.txt"); open(pf, "w").write(big)
     want = hashlib.sha256(big.encode()).hexdigest()[:16]
     p = run_send({}, "alpha", "hermes", "-", "--prompt-file", pf)
