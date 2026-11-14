@@ -1,6 +1,6 @@
 # Self-test results
 
-Loopback run on the dev box, 2026-11-14 16:43 CST. `python3 tests/selftest.py --quick`
+Loopback run on the dev box, 2026-11-14 17:13 CST. `python3 tests/selftest.py`
 
 | Test | Result | Duration | Notes |
 |---|---|---|---|
@@ -9,31 +9,31 @@ Loopback run on the dev box, 2026-11-14 16:43 CST. `python3 tests/selftest.py --
 | multipart over soft limit -> 413 and connection closed | PASS | 0.0s | multipart over soft limit 16777216; PUT /tasks/{id}/files/{name} then POST JSON result |
 | PUT then GET sha256, JSON result files[] | PASS | 0.1s | sha256 d540f823a635… 16781312 bytes; missing name dropped |
 | worker uploads outputs via PUT | PASS | 1.5s | PUT 16781312 bytes sha256 matched |
-| no started webhook; acceptance before the tool finishes | PASS | 4.1s | poll saw running; one done wake |
-| long task (~8s) | PASS | 8.9s | slept 8s; relay-send returned on running |
-| multimodal in+out (png + mp4-ish + txt) | PASS | 1.1s | clip.mp4, image.png, notes.txt, stdout.txt |
-| 5 concurrent tasks | PASS | 8.5s | all 5 done in 8.5s (serial would be 30s) |
-| 2 sender slugs routed to own webhook | PASS | 1.7s | alpha->/wake/alpha, beta->/wake/beta |
+| no started webhook; acceptance before the tool finishes | PASS | 3.9s | poll saw running; one done wake |
+| long task (~60s) | PASS | 61.1s | slept 60s; relay-send returned on running |
+| multimodal in+out (png + mp4-ish + txt) | PASS | 0.9s | clip.mp4, image.png, notes.txt, stdout.txt |
+| 5 concurrent tasks | PASS | 8.8s | all 5 done in 8.8s (serial would be 30s) |
+| 2 sender slugs routed to own webhook | PASS | 1.5s | alpha->/wake/alpha, beta->/wake/beta |
 | worker killed mid-task, restarted | PASS | 8.9s | detached task survived; result uploaded once |
 | worker killed after finish before upload ack (re-upload) | PASS | 4.1s | no duplicate result/wake |
 | server restarted mid-task | PASS | 9.9s | sqlite state kept; worker re-uploaded |
 | box agent restarted | PASS | 7.9s | delivered after restart, no re-wake |
 | failed task -> exactly one failed result | PASS | 3.7s | exit 3: stub error: simulated failure |
 | duplicate task id is idempotent | PASS | 4.1s | second enqueue ignored |
-| missing wake config -> one logged error, no retry | PASS | 4.1s | 1 error line (done only), 0 wakes |
+| missing wake config -> one logged error, no retry | PASS | 3.9s | 1 error line (done only), 0 wakes |
 | primary 503: relay-send, worker and box-agent use the backup; healed -> primary | PASS | 4.6s | 503 -> enqueue/claim/result via backup; healed -> next task via primary; 1 wake each |
-| primary dies mid-task: result mirrored to the backup, one wake | PASS | 76.6s | primary 503 at finish -> mirror to backup; ran once, 1 wake; healed primary row closed out (ack only) |
+| primary dies mid-task: result mirrored to the backup, one wake | PASS | 76.7s | primary 503 at finish -> mirror to backup; ran once, 1 wake; healed primary row closed out (ack only) |
 | same task id on both channels runs once, one wake | PASS | 7.3s | claimed on both servers; ledger ran it once |
 | handoff: primary queues but the worker cannot see it -> backup within RELAY_HANDOFF_S | PASS | 6.0s | accepted via backup after 2.5s; primary copy claimed; ran once |
 | watchdog: a hung server fails a request in bounded time | PASS | 5.0s | deadline 3s -> 3.0s, stall 2s -> 2.0s; channel marked down |
 | chunked PUT: resume after a cut chunk, offset 409, sha256 mismatch 422 | PASS | 1.2s | cut at 3MiB -> resumed to 20971643 bytes, sha256 ok; 409 on wrong offset; 422 on bad sha |
 | stalled chunk sender releases the upload within RELAY_CHUNK_STALL_S; resume is not 409 busy | PASS | 3.5s | sender hung with the socket open; lock freed after 2s stall; resumed from 1 MiB, sha256 ok |
 | Range download resumes; wrong bytes fail the sha256 check and never appear | PASS | 0.1s | 206 resume from 5MiB, sha256 ok; corrupted partial -> Mismatch, nothing delivered |
-| large attachment: staged chunked upload box->Mac, sha256 end to end | PASS | 1.7s | 24 MiB in via staged PUT and back out; sha256 d7757c752486 matched at Mac and box |
-| nested outbox paths keep their relative path | PASS | 0.9s | out/sub/dir/deep.txt -> results/<id>/sub/dir/deep.txt |
-| long prompt (300 KB) via --prompt-file and worker stdin | PASS | 6.9s | 450004 bytes; tool saw the same sha256 prefix f5c1850d9543931d |
-| old (pre-v2) server: legacy multipart in, single PUT out, plain download | PASS | 4.2s | old server: multipart in, 16MiB+ PUT out, nested names flattened; >16MiB input refused (exit 1) |
-| relay-send: primary down -> enqueues via RELAY_FALLBACK_URL | PASS | 2.9s | enqueued on fallback, one done wake |
+| large attachment: staged chunked upload box->Mac, sha256 end to end | PASS | 8.0s | 64 MiB in via staged PUT and back out; sha256 78df63303d69 matched at Mac and box |
+| nested outbox paths keep their relative path | PASS | 1.5s | out/sub/dir/deep.txt -> results/<id>/sub/dir/deep.txt |
+| long prompt (300 KB) via --prompt-file and worker stdin | PASS | 1.1s | 450004 bytes; tool saw the same sha256 prefix f5c1850d9543931d |
+| old (pre-v2) server: legacy multipart in, single PUT out, plain download | PASS | 5.2s | old server: multipart in, 16MiB+ PUT out, nested names flattened; >16MiB input refused (exit 1) |
+| relay-send: primary down -> enqueues via RELAY_FALLBACK_URL | PASS | 2.7s | enqueued on fallback, one done wake |
 | relay-send: enqueue failure exits 1 | PASS | 0.1s | exit 1, no task id |
 | relay-send: accepted wait timeout exits 2 | PASS | 0.6s | exit 2, id on stdout, 已入队、尚未接单 |
 | stale started event is acked, not webhooked | PASS | 0.0s | acked, .wake-started=skipped/no-webhook |
