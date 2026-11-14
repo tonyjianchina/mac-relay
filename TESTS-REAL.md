@@ -35,3 +35,23 @@ Duration = task enqueue → `result.json` written on box.
 
 ## Final state
 worker.json is identical to the original. The worker is running under launchd, the box agent is running, server `mac-relay` is active, and the site returns 200.
+
+---
+
+# Multi-channel run (Tailscale primary, VPS backup)
+
+Date: 2026-11-14, 15:57–17:15 (UTC+8). Box relay `http://<BOX_TS_IP>:18790` (box side `127.0.0.1:18790`) as primary; VPS relay `<VPS_URL>/relay` and `http://<VPS_TS_IP>:18791` as backups (the VPS server was still on the pre-v2 protocol: legacy mode). Mac worker polls all three. Box↔Mac traffic went through a Tailscale DERP relay (no direct path): about 130–370 KB/s Mac→box, 30–50 KB/s box→Mac, RTT 0.3–1.7 s, with short drops. Mac→VPS tailnet about 10 MB/s; VPS→box about 1.1 MB/s.
+Tasks used the deterministic `selftest` tool via `prompt_routes` (no model calls) and a box-local test webhook. Each result carries a `manifest.json` with the sha256 of every inbox/outbox file as seen on the Mac; the box re-hashed every downloaded file.
+
+| Scenario | Task | Result | Time | Evidence |
+|---|---|---|---|---|
+| Primary normal (1 MiB in, copy out, nested path) | rt-normal-155746 | PASS | ~60 s | sha256 equal in/out; `sub/dir/deep.txt` kept |
+| 10 MiB result | rt-thru10-155904 | PASS | 29 s | sha ok, via primary |
+| Primary down for the sender → backup | rt-primary-down-162933 | PASS | 209 s | enqueue via VPS; 5 MiB in + 10 MiB out; result via VPS tailnet; 1 wake |
+| 300 KB prompt | rt-bigprompt-162933 | PASS | 25 s | prompt sha256 equal on the Mac |
+| 4 tasks, 3 senders, one `failed` | rt-conc-{a,b,d,fail}-163318 | PASS | 26–258 s | a real DERP stall made the worker mirror 3 results to the VPS after 60 s; 1 wake each; copies acked; origin rows closed out 10 min later |
+| 300 MiB result, worker restart and server restart mid-upload | rt-big300-163832 | PASS | 693 s | resumed at 40,158,592 after worker restart; box server restart → mirrored to VPS tailnet (300 MiB in 31 s), box agent fetched it in 274 s; sha256 `80946bde…a3d2fb` equal on both ends |
+| Handoff (Mac cannot see the primary) | rt-handoff-165219 | PASS | 26 s | handed to backup after 22 s; primary copy withdrawn |
+| Started wait shorter than acceptance | rt-started-timeout-165219 | PASS | 27 s | `relay-send` exit 2, task still ran, 1 wake |
+| Box VM reboot during a 30 MiB attachment download (staged, chunked upload) | rt-attach30-165219 | PASS | 24 min (incl. ~9 min box down; DERP 30–50 KB/s) | after the stack restart the Mac resumed with `Range` (HTTP 206); sha256 `80560c03…9022d7` equal on the Mac; 1 wake |
+| Worker upgrade in place (3 times) | mac-upgrade-* | PASS | ~80 s each | the running upgrade task survived the restart and was delivered by the new worker |

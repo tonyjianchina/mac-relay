@@ -8,8 +8,10 @@ LONG = 8 if QUICK else 60
 T = tempfile.mkdtemp(prefix="mac-relay-test-")
 def port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
-PORT, DEAD, HOOK, FLAKY = port(), port(), port(), port()
+PORT, DEAD, HOOK, FLAKY, PORT2, OLDP, HANG = port(), port(), port(), port(), port(), port(), port()
 URL = f"http://127.0.0.1:{PORT}"
+URL2 = f"http://127.0.0.1:{PORT2}"  # second relay server = the backup channel
+OLDURL = f"http://127.0.0.1:{OLDP}"  # the pre-v2 server.py from git, for compatibility
 SECRET = os.path.join(T, "secret"); open(SECRET, "w").write(os.urandom(24).hex())
 WAKES = []  # (slug, body, auth)
 class Hook(BaseHTTPRequestHandler):
@@ -25,7 +27,10 @@ for slug in ("alpha", "beta"):
     open(f"{WAKE}/{slug}.key", "w").write(f"key-{slug}")
 RES = os.path.join(T, "results")
 ENV = dict(os.environ, RELAY_URL=URL, RELAY_SECRET_FILE=SECRET, RELAY_DATA_DIR=os.path.join(T, "data"),
-           RELAY_PORT=str(PORT), RELAY_CLAIM_TTL="5", RELAY_RESULTS_DIR=RES, RELAY_WAKE_DIR=WAKE)
+           RELAY_PORT=str(PORT), RELAY_CLAIM_TTL="5", RELAY_RESULTS_DIR=RES, RELAY_WAKE_DIR=WAKE,
+           RELAY_STUB_RUNS=os.path.join(T, "runs.log"))
+ENV.pop("RELAY_FALLBACK_URL", None)
+ENV["RELAY_CHUNK_STALL_S"] = "2"
 stub = [sys.executable, os.path.join(ROOT, "tests/stub_tool.py")]
 import urllib.request, urllib.error, urllib.parse
 BROKEN = {"on": True}  # FLAKY = primary that answers 503 (like Caddy with a dead upstream) until healed
@@ -51,24 +56,28 @@ threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", FLAKY), Flaky).serve_f
 def wcfg(primary, name, **kw):
     state = kw.pop("state_dir_name", "mac-state")
     p = os.path.join(T, name)
-    json.dump({"primary_url": primary, "fallback_url": URL, "secret_file": SECRET, "state_dir": os.path.join(T, state),
-               "worker_name": "mac", "fail_threshold": 2, "cooldown_s": 3600, "max_backoff_s": 4,
-               "tools": {t: stub + [t, "{prompt}"] for t in ("hermes", "deepseek", "codex", "schwab")}, **kw}, open(p, "w"))
+    fb = kw.pop("fallback", URL2)
+    cfg = {"primary_url": primary, "fallback_url": fb, "secret_file": SECRET, "state_dir": os.path.join(T, state),
+           "worker_name": "mac", "max_backoff_s": 4, "mirror_after_s": 4, "closeout_after_s": 2, "stdin_prompt_over": {"hermes": 100000},
+           "tools": {t: stub + [t, "{prompt}"] for t in ("hermes", "deepseek", "codex", "schwab")}, **kw}
+    json.dump(cfg, open(p, "w"))
     return p
-CFG_OK, CFG_FB = wcfg(URL, "worker.json"), wcfg(f"http://127.0.0.1:{DEAD}", "worker-fb.json")
-CFG_503 = wcfg(f"http://127.0.0.1:{FLAKY}", "worker-503.json", cooldown_s=4, fallback_source_ip="127.0.0.1")
-CFG_ISO = wcfg(URL, "worker-iso.json", state_dir_name="mac-state-iso", upload_4xx_quarantine=2, max_backoff_s=2)
+CFG_OK = wcfg(URL, "worker.json")
+CFG_ISO = wcfg(URL, "worker-iso.json", state_dir_name="mac-state-iso", upload_4xx_quarantine=2, max_backoff_s=2, fallback=URL)
 P = {}
-def spawn(name, cmd):
-    P[name] = subprocess.Popen(cmd, env=ENV, stdout=open(f"{T}/{name}.log", "a"), stderr=subprocess.STDOUT, start_new_session=True)
+def spawn(name, cmd, **env):
+    P[name] = subprocess.Popen(cmd, env=dict(ENV, **env), stdout=open(f"{T}/{name}.log", "a"), stderr=subprocess.STDOUT, start_new_session=True)
 def kill(name):
-    P[name].send_signal(signal.SIGKILL); P[name].wait()
+    if name in P and P[name].poll() is None:
+        P[name].send_signal(signal.SIGKILL)
+    if name in P: P[name].wait()
 def server(): spawn("server", [sys.executable, f"{ROOT}/relay/server.py"]); time.sleep(0.6)
+def server2(): spawn("server2", [sys.executable, f"{ROOT}/relay/server.py"], RELAY_PORT=str(PORT2),
+                     RELAY_DATA_DIR=os.path.join(T, "data2")); time.sleep(0.6)
 def worker(cfg=CFG_OK): spawn("worker", [sys.executable, f"{ROOT}/mac/relay-worker.py", cfg])
+AGENT_ENV = {"RELAY_FALLBACK_URL": URL2}
 def agent(**env):
-    spawn("agent", [sys.executable, f"{ROOT}/bin/relay-box-agent"])
-    if env: P["agent"].kill(); P["agent"].wait(); P["agent"] = subprocess.Popen([sys.executable, f"{ROOT}/bin/relay-box-agent"],
-        env=dict(ENV, **env), stdout=open(f"{T}/agent.log", "a"), stderr=subprocess.STDOUT, start_new_session=True)
+    spawn("agent", [sys.executable, f"{ROOT}/bin/relay-box-agent"], **dict(AGENT_ENV, **env))
 def send(slug, tool, prompt, *files, tid=None):
     cmd = [f"{ROOT}/bin/relay-send", slug, tool, prompt] + sum([["--file", f] for f in files], []) + (["--id", tid] if tid else [])
     t0 = time.time()
@@ -143,7 +152,7 @@ def test(name):
         ROWS.append((name, ok, f"{time.time() - t0:.1f}s", note)); print(ok, name, f"{time.time()-t0:.1f}s", note, flush=True)
     return deco
 
-server(); worker(); agent()
+server(); server2(); worker(); agent()
 
 @test("short task")
 def _():
@@ -312,46 +321,259 @@ def _():
     assert "missing" in open(os.path.join(RES, tid, ".wake")).read()
     return "1 error line (done only), 0 wakes"
 
-@test("primary down -> fallback used (sticky)")
-def _():
-    kill("worker"); os.remove(os.path.join(T, "mac-state/conn.json")) if os.path.exists(os.path.join(T, "mac-state/conn.json")) else None
-    worker(CFG_FB); tid = send("beta", "hermes", "via fallback"); wait_result(tid, 40); expect_wakes(tid, "beta")
-    st = json.load(open(os.path.join(T, "mac-state/conn.json"))); assert st["mode"] == "fallback", st
-    tid2 = send("beta", "hermes", "still fallback"); wait_result(tid2, 20); expect_wakes(tid2, "beta")
-    st2 = json.load(open(os.path.join(T, "mac-state/conn.json"))); assert st2 == st, "flip-flopped"
-    return "switched after 2 primary failures, stayed on fallback"
+sys.path.insert(0, ROOT)
+from relay import net as NET
+FLAKY_URL = f"http://127.0.0.1:{FLAKY}"
+CFG_CH = wcfg(FLAKY_URL, "worker-ch.json", fallback=URL2)  # same ledger (state dir) as CFG_OK
+def api_at(base, method, path, body=None, ctype=None, timeout=120, headers=None):
+    r = urllib.request.Request(base + path, data=body, method=method)
+    r.add_header("Authorization", bearer())
+    if ctype: r.add_header("Content-Type", ctype)
+    for k, v in (headers or {}).items(): r.add_header(k, v)
+    try:
+        with OPENER.open(r, timeout=timeout) as resp: return resp.status, resp.read(), resp.headers
+    except urllib.error.HTTPError as e: return e.code, e.read(), e.headers
+def run_send(env, *args, stdin=None):
+    return subprocess.run([f"{ROOT}/bin/relay-send", *args], env=dict(ENV, **env), capture_output=True, text=True, input=stdin)
+def runs(tid):
+    try: return open(os.path.join(T, "runs.log")).read().split().count(tid)
+    except OSError: return 0
+def wait_log(name, needle, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        if needle in open(f"{T}/{name}.log").read(): return True
+        time.sleep(0.3)
+    raise AssertionError(f"{needle!r} not in {name}.log after {timeout}s")
+CH_ENV = {"RELAY_URL": FLAKY_URL, "RELAY_FALLBACK_URL": URL2}
 
-@test("primary 503 -> fallback, one delivery, then sticky switch back")
+@test("primary 503: relay-send, worker and box-agent use the backup; healed -> primary")
 def _():
-    cf = os.path.join(T, "mac-state/conn.json")
-    kill("worker"); os.path.exists(cf) and os.remove(cf); BROKEN["on"] = True
-    worker(CFG_503); tid = send("alpha", "hermes", "primary says 503"); wait_result(tid, 40); time.sleep(2); expect_wakes(tid, "alpha")
-    st = json.load(open(cf)); assert st["mode"] == "fallback", st
-    time.sleep(5); st2 = json.load(open(cf)); assert st2 == st, "probed a still-503 primary and flipped"
-    BROKEN["on"] = False; end = time.time() + 70
-    while time.time() < end and json.load(open(cf))["mode"] != "primary": time.sleep(0.5)
-    assert json.load(open(cf))["mode"] == "primary", "did not switch back after primary healed"
-    tid2 = send("alpha", "hermes", "back on primary"); wait_result(tid2, 40); time.sleep(2); expect_wakes(tid2, "alpha")
-    log = open(f"{T}/worker.log").read(); assert log.count("connection -> fallback") >= 1
-    return "503 x2 -> fallback; stayed while 503; healed -> primary; one done wake each"
+    kill("worker"); kill("agent"); BROKEN["on"] = True
+    try:
+        worker(CFG_CH); agent(**CH_ENV)
+        p = run_send(CH_ENV, "alpha", "hermes", "primary broken")
+        assert p.returncode == 0 and "via backup" in p.stderr, (p.returncode, p.stderr)
+        tid = p.stdout.strip(); r = wait_result(tid, 40); expect_wakes(tid, "alpha")
+        wait_log("agent", f"delivered {tid} done via backup", 10)
+        BROKEN["on"] = False
+        wait_log("worker", "channel primary recovered", 30)
+        p2 = run_send(CH_ENV, "beta", "hermes", "primary healed")
+        assert p2.returncode == 0 and "via primary" in p2.stderr, (p2.returncode, p2.stderr)
+        tid2 = p2.stdout.strip(); wait_result(tid2, 40); expect_wakes(tid2, "beta")
+        wait_log("agent", f"delivered {tid2} done via primary", 10)
+        assert f"claimed {tid2} hermes via primary" in open(f"{T}/worker.log").read()
+        return "503 -> enqueue/claim/result via backup; healed -> next task via primary; 1 wake each"
+    finally:
+        BROKEN["on"] = False
 
-@test("box-agent: primary 503 -> fallback, one wake, then switch back")
+@test("primary dies mid-task: result mirrored to the backup, one wake")
 def _():
-    alog = f"{T}/agent.log"; n0, p0 = open(alog).read().count("connection -> fallback"), open(alog).read().count("connection -> primary")
-    kill("agent"); BROKEN["on"] = True
-    # Leave worker as-is (may be on fallback from prior test). Confirm still clears the claim lease.
-    agent(RELAY_URL=f"http://127.0.0.1:{FLAKY}", RELAY_FALLBACK_URL=URL, RELAY_FAIL_THRESHOLD="2", RELAY_COOLDOWN_S="4")
-    end = time.time() + 30
-    while time.time() < end and open(alog).read().count("connection -> fallback") == n0: time.sleep(0.3)
-    assert open(alog).read().count("connection -> fallback") == n0 + 1, "agent did not switch to fallback"
-    tid = send("alpha", "hermes", "agent on fallback"); wait_result(tid, 90); time.sleep(2); expect_wakes(tid, "alpha")
-    time.sleep(5); assert open(alog).read().count("connection -> primary") == p0, "flipped back while primary still 503"
-    BROKEN["on"] = False; end = time.time() + 70  # long-poll (50s) must return before the next probe
-    while time.time() < end and open(alog).read().count("connection -> primary") == p0: time.sleep(0.5)
-    assert open(alog).read().count("connection -> primary") == p0 + 1, "agent did not switch back"
-    tid2 = send("beta", "hermes", "agent back on primary"); wait_result(tid2, 40); time.sleep(2); expect_wakes(tid2, "beta")
-    assert open(alog).read().count("connection -> fallback") == n0 + 1, "flip-flopped"
-    return "2x503 -> fallback; one done wake; healed -> primary"
+    BROKEN["on"] = False
+    p = run_send(CH_ENV, "alpha", "hermes", "sleep=6 mid-task switch")
+    assert p.returncode == 0 and "via primary" in p.stderr, p.stderr
+    tid = p.stdout.strip(); time.sleep(1); BROKEN["on"] = True
+    try:
+        r = wait_result(tid, 60); expect_wakes(tid, "alpha")
+        wlog = open(f"{T}/worker.log").read()
+        assert f"mirror {tid} -> fallback" in wlog, "no mirror"
+        wait_log("agent", f"delivered {tid} done via backup", 10)
+        assert runs(tid) == 1, runs(tid)
+        BROKEN["on"] = False  # primary heals: the worker closes the stale running row there
+        wait_log("worker", f"closeout {tid} on primary", 90)
+        wait_log("agent", f"duplicate {tid} via primary - already delivered, ack only", 30)
+        expect_wakes(tid, "alpha")
+        return "primary 503 at finish -> mirror to backup; ran once, 1 wake; healed primary row closed out (ack only)"
+    finally:
+        BROKEN["on"] = False
+
+@test("same task id on both channels runs once, one wake")
+def _():
+    tid = "dual-1"
+    body = json.dumps({"id": tid, "sender": "beta", "tool": "hermes", "prompt": "sleep=2 dual"}).encode()
+    assert api_at(URL, "POST", "/tasks", body, "application/json")[0] == 201
+    assert api_at(URL2, "POST", "/tasks", body, "application/json")[0] == 201
+    wait_result(tid, 40); time.sleep(4); expect_wakes(tid, "beta")
+    assert runs(tid) == 1, f"ran {runs(tid)} times"
+    assert f"duplicate claim {tid}" in open(f"{T}/worker.log").read()
+    return "claimed on both servers; ledger ran it once"
+
+@test("handoff: primary queues but the worker cannot see it -> backup within RELAY_HANDOFF_S")
+def _():
+    BROKEN["on"] = True  # the worker reaches the primary only through FLAKY
+    try:
+        e = {"RELAY_URL": URL, "RELAY_FALLBACK_URL": URL2, "RELAY_HANDOFF_S": "2"}
+        t0 = time.time(); p = run_send(e, "beta", "hermes", "handoff please")
+        assert p.returncode == 0 and "handoff" in p.stderr and "via backup" in p.stderr, p.stderr
+        tid = p.stdout.strip(); took = time.time() - t0
+        # Queued -> withdrawn. If a long-poll already in flight through the proxy took the claim
+        # (its confirm then 503s), the copy is refused withdrawal and the ledger dedupes instead.
+        pst = json.loads(api_at(URL, "GET", f"/tasks/{tid}")[1])["task"]["state"]
+        assert ("-> withdrawn" in p.stderr and pst == "withdrawn") or pst in ("claimed", "running", "done", "queued"), (pst, p.stderr)
+        wait_result(tid, 40); time.sleep(2); expect_wakes(tid, "beta"); assert runs(tid) == 1
+        return f"accepted via backup after {took:.1f}s; primary copy {pst}; ran once"
+    finally:
+        BROKEN["on"] = False
+
+@test("watchdog: a hung server fails a request in bounded time")
+def _():
+    hs = socket.socket(); hs.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); hs.bind(("127.0.0.1", HANG)); hs.listen(4)
+    held = []
+    def hang():
+        while True:
+            c, _ = hs.accept(); held.append(c)  # read nothing, answer nothing
+    threading.Thread(target=hang, daemon=True).start()
+    ep = NET.Endpoint(f"http://127.0.0.1:{HANG}", open(SECRET).read().strip(), "hang")
+    out = []
+    for kw in ({"deadline": 3}, {"deadline": 300, "stall": 2}):
+        t0 = time.time()
+        try:
+            ep.call("GET", "/tasks/next?wait=50", **kw); raise AssertionError("no timeout")
+        except TimeoutError:
+            out.append(time.time() - t0)
+    assert out[0] < 6 and out[1] < 5, out
+    assert not ep.healthy()
+    return f"deadline 3s -> {out[0]:.1f}s, stall 2s -> {out[1]:.1f}s; channel marked down"
+
+@test("chunked PUT: resume after a cut chunk, offset 409, sha256 mismatch 422")
+def _():
+    tid = "chunk-1"  # mirror row: never handed to the worker that is polling this server
+    assert api("POST", "/tasks", json.dumps({"id": tid, "sender": "alpha", "tool": "hermes", "prompt": "chunk",
+                                             "mirror": True}).encode(), "application/json")[0] == 201
+    path = os.path.join(T, "chunk.bin"); n = 20 * 1024 * 1024 + 123
+    with open(path, "wb") as f: f.write(os.urandom(n))
+    want = sha_file(path)
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+    s.sendall((f"PUT /tasks/{tid}/files/chunk.bin?kind=out&offset=0&total={n} HTTP/1.1\r\nHost: x\r\n"
+               f"Authorization: {bearer()}\r\nContent-Type: application/octet-stream\r\n"
+               f"Content-Length: {8 * 1024 * 1024}\r\n\r\n").encode())
+    s.sendall(open(path, "rb").read(3 * 1024 * 1024)); time.sleep(0.5); s.close(); time.sleep(0.5)
+    st = json.loads(api("GET", f"/uploads/{tid}/chunk.bin?kind=out")[1])
+    assert st["partial"] == 3 * 1024 * 1024 and not st["complete"], st
+    st, raw, _ = api("PUT", f"/tasks/{tid}/files/chunk.bin?kind=out&offset=0&total={n}", b"x" * 10, "application/octet-stream")
+    assert st == 409 and json.loads(raw)["partial"] == 3 * 1024 * 1024, (st, raw)
+    st, raw, _ = api("GET", f"/files/{tid}/out/chunk.bin")
+    assert st == 404, "partial upload visible as a file"
+    logs = []
+    ep = NET.Endpoint(URL, open(SECRET).read().strip(), "a")
+    m = NET.upload_file(ep, tid, "out", path, "chunk.bin", log=lambda *a: logs.append(a))
+    assert m["sha256"] == want and any(a[0] == "resume" for a in logs), logs
+    got, gn = sha_get(f"/files/{tid}/out/chunk.bin"); assert got == want and gn == n
+    st, raw, _ = api("PUT", f"/tasks/{tid}/files/bad.bin?kind=out&offset=0&total=4&sha256={'0' * 64}", b"abcd",
+                     "application/octet-stream")
+    assert st == 422, (st, raw)
+    st = json.loads(api("GET", f"/uploads/{tid}/bad.bin?kind=out")[1]); assert st["partial"] == 0 and not st["complete"], st
+    assert api("GET", f"/files/{tid}/out/bad.bin")[0] == 404
+    api("POST", f"/tasks/{tid}/result", json.dumps({"status": "done", "summary": "c", "files": ["chunk.bin"]}).encode(), "application/json")
+    meta = json.loads(api("GET", f"/tasks/{tid}")[1])["task"]["files_meta"]
+    assert meta == [{"name": "chunk.bin", "size": n, "sha256": want}], meta
+    api("POST", f"/results/{tid}/ack", b"{}", "application/json")
+    return f"cut at 3MiB -> resumed to {n} bytes, sha256 ok; 409 on wrong offset; 422 on bad sha"
+
+@test("stalled chunk sender releases the upload within RELAY_CHUNK_STALL_S; resume is not 409 busy")
+def _():
+    tid = "chunk-2"
+    assert api("POST", "/tasks", json.dumps({"id": tid, "sender": "alpha", "tool": "hermes", "prompt": "stall",
+                                             "mirror": True}).encode(), "application/json")[0] == 201
+    path = os.path.join(T, "stall.bin"); n = 4 * 1024 * 1024
+    with open(path, "wb") as f: f.write(os.urandom(n))
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    s.sendall((f"PUT /tasks/{tid}/files/stall.bin?kind=out&offset=0&total={n} HTTP/1.1\r\nHost: x\r\n"
+               f"Authorization: {bearer()}\r\nContent-Type: application/octet-stream\r\n"
+               f"Content-Length: {n}\r\n\r\n").encode())
+    s.sendall(open(path, "rb").read(1024 * 1024))  # then hang with the socket open
+    try:
+        time.sleep(3.5)
+        st = json.loads(api("GET", f"/uploads/{tid}/stall.bin?kind=out")[1])
+        assert st["partial"] == 1024 * 1024, st
+        logs = []
+        ep = NET.Endpoint(URL, open(SECRET).read().strip(), "a")
+        m = NET.upload_file(ep, tid, "out", path, "stall.bin", log=lambda *a: logs.append(a))
+        assert m["sha256"] == sha_file(path), m
+    finally:
+        s.close()
+    api("POST", f"/results/{tid}/ack", b"{}", "application/json")
+    return "sender hung with the socket open; lock freed after 2s stall; resumed from 1 MiB, sha256 ok"
+
+@test("Range download resumes; wrong bytes fail the sha256 check and never appear")
+def _():
+    tid, n = "chunk-1", 20 * 1024 * 1024 + 123
+    want = sha_file(os.path.join(T, "chunk.bin"))
+    ep = NET.Endpoint(URL, open(SECRET).read().strip(), "a")
+    d = os.path.join(T, "dl"); os.makedirs(d, exist_ok=True)
+    dest = os.path.join(d, "ok.bin")
+    with open(dest + ".partial", "wb") as f: f.write(open(os.path.join(T, "chunk.bin"), "rb").read(5 * 1024 * 1024))
+    NET.download_file(ep, tid, "out", "chunk.bin", dest, n, want)
+    assert sha_file(dest) == want and not os.path.exists(dest + ".partial")
+    assert '"GET /files/chunk-1/out/chunk.bin HTTP/1.1" 206' in open(f"{T}/server.log").read()
+    bad = os.path.join(d, "bad.bin")
+    with open(bad + ".partial", "wb") as f: f.write(os.urandom(5 * 1024 * 1024))
+    try:
+        NET.download_file(ep, tid, "out", "chunk.bin", bad, n, want); raise AssertionError("bad bytes accepted")
+    except NET.Mismatch:
+        pass
+    assert not os.path.exists(bad) and not os.path.exists(bad + ".partial")
+    return "206 resume from 5MiB, sha256 ok; corrupted partial -> Mismatch, nothing delivered"
+
+@test("large attachment: staged chunked upload box->Mac, sha256 end to end")
+def _():
+    kill("worker"); kill("agent"); worker(); agent()
+    mb = 24 if QUICK else 64
+    src = os.path.join(T, "att.bin")
+    with open(src, "wb") as f:
+        for _i in range(mb): f.write(os.urandom(1024 * 1024))
+    want = sha_file(src)
+    tid = send("alpha", "hermes", "copyin please", src)
+    assert "uploaded att.bin" in send.err, send.err
+    r = wait_result(tid, 120); expect_wakes(tid, "alpha")
+    assert sha_file(os.path.join(T, "mac-state", "tasks", tid, "in", "att.bin")) == want
+    assert sha_file(os.path.join(RES, tid, "copy-att.bin")) == want
+    assert "committed " + tid in open(f"{T}/server.log").read()
+    return f"{mb} MiB in via staged PUT and back out; sha256 {want[:12]} matched at Mac and box"
+
+@test("nested outbox paths keep their relative path")
+def _():
+    tid = send("beta", "hermes", "nested please"); r = wait_result(tid, 30); expect_wakes(tid, "beta")
+    p = os.path.join(RES, tid, "sub", "dir", "deep.txt")
+    assert open(p).read() == "deep\n" and p in r["files"], r["files"]
+    return "out/sub/dir/deep.txt -> results/<id>/sub/dir/deep.txt"
+
+@test("long prompt (300 KB) via --prompt-file and worker stdin")
+def _():
+    big = ("long-prompt\u00e9 " * 50000)[:100000] + "x" * 200000 + " end"
+    pf = os.path.join(T, "prompt.txt"); open(pf, "w").write(big)
+    want = hashlib.sha256(big.encode()).hexdigest()[:16]
+    p = run_send({}, "alpha", "hermes", "-", "--prompt-file", pf)
+    assert p.returncode == 0, p.stderr
+    tid = p.stdout.strip(); r = wait_result(tid, 30); expect_wakes(tid, "alpha")
+    assert f"len={len(big.encode())} sha={want}" in r["summary"], r["summary"]
+    return f"{len(big.encode())} bytes; tool saw the same sha256 prefix {want}"
+
+@test("old (pre-v2) server: legacy multipart in, single PUT out, plain download")
+def _():
+    old = os.path.join(T, "old_server.py")
+    open(old, "w").write(subprocess.run(["git", "-C", ROOT, "show", "4782f20:relay/server.py"], capture_output=True,
+                                        text=True, check=True).stdout)
+    spawn("old", [sys.executable, old], RELAY_PORT=str(OLDP), RELAY_DATA_DIR=os.path.join(T, "data-old")); time.sleep(0.6)
+    cfg = wcfg(OLDURL, "worker-old.json", state_dir_name="mac-state-old", fallback=None)
+    spawn("worker-old", [sys.executable, f"{ROOT}/mac/relay-worker.py", cfg])
+    spawn("agent-old", [sys.executable, f"{ROOT}/bin/relay-box-agent"], RELAY_URL=OLDURL)
+    try:
+        src = os.path.join(T, "small.png"); open(src, "wb").write(os.urandom(4000))
+        p = run_send({"RELAY_URL": OLDURL}, "alpha", "hermes", "big copyin nested", "--file", src)
+        assert p.returncode == 0, p.stderr
+        tid = p.stdout.strip(); r = wait_result(tid, 60); time.sleep(2)
+        w = wakes_for(tid); assert [x[1]["status"] for x in w] == ["done"], w  # old server's started event: acked, no wake
+        local = os.path.join(T, "mac-state-old", "tasks", tid, "out", "big.bin")
+        assert sha_file(os.path.join(RES, tid, "big.bin")) == sha_file(local)
+        assert os.path.exists(os.path.join(RES, tid, "sub__dir__deep.txt")), os.listdir(os.path.join(RES, tid))
+        assert open(os.path.join(RES, tid, "copy-small.png"), "rb").read() == open(src, "rb").read()
+        huge = os.path.join(T, "huge.bin")
+        with open(huge, "wb") as f: f.truncate(17 * 1024 * 1024)
+        p = run_send({"RELAY_URL": OLDURL}, "alpha", "hermes", "too big", "--file", huge)
+        assert p.returncode == 1 and "16MiB multipart cap" in p.stderr, p.stderr
+        return "old server: multipart in, 16MiB+ PUT out, nested names flattened; >16MiB input refused (exit 1)"
+    finally:
+        for n in ("worker-old", "agent-old", "old"): kill(n)
 
 @test("relay-send: primary down -> enqueues via RELAY_FALLBACK_URL")
 def _():
@@ -659,6 +881,12 @@ def _():
         if P["worker"].poll() is None:
             kill("worker")
         worker(); agent()
+
+@test("worker embeds relay/net.py verbatim")
+def _():
+    net = open(os.path.join(ROOT, "relay", "net.py")).read().strip()
+    assert net in open(os.path.join(ROOT, "mac", "relay-worker.py")).read(), "mac/relay-worker.py net block drifted"
+    return "net block identical"
 
 for n in list(P): kill(n)
 # Each confirmed task contributes exactly one final wake (done|failed). No started webhooks.
