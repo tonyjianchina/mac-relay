@@ -53,5 +53,5 @@ Tasks used the deterministic `selftest` tool via `prompt_routes` (no model calls
 | 300 MiB result, worker restart and server restart mid-upload | rt-big300-163832 | PASS | 693 s | resumed at 40,158,592 after worker restart; box server restart → mirrored to VPS tailnet (300 MiB in 31 s), box agent fetched it in 274 s; sha256 `80946bde…a3d2fb` equal on both ends |
 | Handoff (Mac cannot see the primary) | rt-handoff-165219 | PASS | 26 s | handed to backup after 22 s; primary copy withdrawn |
 | Started wait shorter than acceptance | rt-started-timeout-165219 | PASS | 27 s | `relay-send` exit 2, task still ran, 1 wake |
-| Box VM reboot during a 30 MiB attachment download | rt-attach30-165219 | see below | | after the stack restart the Mac resumed with `Range` (HTTP 206) |
+| Box VM reboot during a 30 MiB attachment download (staged, chunked upload) | rt-attach30-165219 | PASS | 24 min (incl. ~9 min box down; DERP 30–50 KB/s) | after the stack restart the Mac resumed with `Range` (HTTP 206); sha256 `80560c03…9022d7` equal on the Mac; 1 wake |
 | Worker upgrade in place (3 times) | mac-upgrade-* | PASS | ~80 s each | the running upgrade task survived the restart and was delivered by the new worker |
