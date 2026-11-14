@@ -7,9 +7,9 @@ together.
 
 | Component | Config | What it does with several channels |
 |---|---|---|
-| `relay-send` | `RELAY_URL` (primary), `RELAY_FALLBACK_URL` (comma list, in order) | Posts the task to the first channel that accepts the enqueue. If the Mac has not accepted it within `RELAY_HANDOFF_S` (default 20 s), posts the same task id to the next channel and withdraws the first copy if it is still queued. Waits up to `RELAY_STARTED_WAIT_S` (default 45 s) in total, polling every channel it posted to. |
-| `relay-box-agent` | same env | Long-polls `/results/next` on every channel at once. A result is delivered (files downloaded, `result.json`, one wake) once per task id, whichever channel it comes from. Copies from other channels are acked only. |
-| Mac worker | `endpoints` in `worker.json` (ordered list, first = primary) | Long-polls `/tasks/next` on every endpoint at once. Returns results to the channel(s) it claimed the task from, primary first. If those fail for `mirror_after_s` (default 60 s), it mirrors the task onto another channel and delivers there. |
+| `relay-send` | `RELAY_URL` (primary), `RELAY_FALLBACK_URL` (comma list, in order), `RELAY_BIG_BYTES` (default 8 MiB) | Posts the task to the first channel that accepts the enqueue. If the combined `--file` size is over `RELAY_BIG_BYTES`, the public URL in `RELAY_FALLBACK_URL` (first https fallback, or the first fallback if none is https) is tried first; the other channels follow in their original order if that one cannot take it. If the Mac has not accepted it within `RELAY_HANDOFF_S` (default 20 s), posts the same task id to the next channel and withdraws the first copy if it is still queued. Waits up to `RELAY_STARTED_WAIT_S` (default 45 s) in total, polling every channel it posted to. |
+| `relay-box-agent` | same env | Long-polls `/results/next` on every channel at once. A result is delivered (files downloaded, `result.json`, one wake) once per task id. Above `RELAY_BIG_BYTES`, files come from the configured public endpoint when that endpoint has the same complete files; otherwise from the channel that offered the event. The ack goes to the event channel. Copies from other channels are acked only. |
+| Mac worker | `endpoints` in `worker.json` (ordered list, first = primary); optional `public_endpoint`, `big_bytes` | Long-polls `/tasks/next` on every endpoint at once. Returns results to the channel(s) it claimed the task from, primary first. If the result files together exceed `big_bytes` (default 8 MiB, or `RELAY_BIG_BYTES`), they go to the public channel first (the first https endpoint, or `public_endpoint` by name or URL) — mirrored there if needed, without waiting for `mirror_after_s`. If the origins fail for `mirror_after_s` (default 60 s), it mirrors the task onto another channel and delivers there. |
 
 Channel state (`channel <name> down: …` / `channel <name> recovered after N s`) is logged once
 per transition. A channel counts as down after a connection error, a timeout, or HTTP 5xx.
@@ -64,14 +64,40 @@ two-entry list.
   the file becomes visible (`422` on mismatch, partial deleted). `GET /uploads/{id}/{name}?kind=`
   returns the resume point, so an upload resumes after a dropped connection, a worker restart,
   or a server restart. A sender that stalls with the socket open frees the upload after
-  `RELAY_CHUNK_STALL_S` (default 30 s). A resume point that grew since the last attempt restarts
-  the mirror clock, so a slow but working channel is not abandoned.
+  `RELAY_CHUNK_STALL_S` (default 30 s) and answers `400 {"error":"short body","partial":N}`,
+  keeping those bytes. The client resumes from N in the same attempt when N is an integer
+  between the offset it just sent and the file size. If N does not move, it retries twice
+  and then gives up on that channel. A full 8MiB chunk is larger than a typical TCP window:
+  if the peer answers with 409 or this 400 and stops reading, the client reads that response
+  instead of blocking in the send until the stall timeout, then retries the chunk. A 409 that
+  stays `busy` stops after a few tries and the channel is abandoned. Any other 400 (`bad name`,
+  `bad offset/total`, or a body that is not that JSON) stays fatal. A resume point that grew
+  since the last attempt
+  restarts the mirror clock, so a slow but working channel is not abandoned.
 - **Downloads (box agent, worker attachments).** Written to `<name>.partial`, resumed with
   `Range`, checked against the size and sha256 the server recorded, then renamed. A partial file
   never appears under its final name.
 - **Attachments (box to Mac).** On v2 servers `relay-send` creates the task as `staged`, uploads
   each `--file` with the same chunked PUT, then commits; the task is not claimable until every
-  attachment is complete and verified. Old servers get multipart (16 MiB cap).
+  attachment is complete and verified. Old servers get multipart (16 MiB cap). If the combined
+  attachment size is over `RELAY_BIG_BYTES` (default 8 MiB), `relay-send` posts the task to the
+  public fallback URL first. The worker also fetches those attachments from the public https
+  endpoint first, even if it claimed the task on another URL of the same server (for example the
+  VPS tailnet address), and can resume a mid-file download there.
+- **Big results (Mac to box).** If the outbox (plus stdout/stderr) is over `big_bytes` (same
+  default), the worker uploads to the public https endpoint first, mirroring the task there when
+  it was claimed on another channel. If that upload does not finish, the files go out on another
+  channel and the public row stays `running`. The worker does not POST a file-less result there.
+  `GET /tasks` does not show the box-agent's delivery ack, and a timer cannot prove the real
+  result was taken; that empty `done` can be the first event a restarted box-agent handles and
+  would wake the sender with no files. A `running` row is not offered on `/results/next`. To
+  reclaim the disk, remove that task's row and `files/<id>/` on the public relay by hand. Do not
+  clear it with an empty result. The box agent, for a result over `RELAY_BIG_BYTES`,
+  downloads from the configured public endpoint only when that endpoint already has every file
+  complete with the same size and sha256; otherwise it uses the channel that offered the event.
+  It does not try any other endpoint. The ack goes to the event channel, and a second copy
+  wakes the sender once. `public_endpoint` in `worker.json` overrides the https heuristic (used
+  by the loopback selftest, which has no TLS).
 - **Prompts.** `relay-send … -` reads the prompt from stdin, `--prompt-file` from a file. The
   worker passes prompts longer than `stdin_prompt_over[tool]` bytes on stdin (`"-"` as the
   prompt argument) instead of argv.

@@ -4,9 +4,9 @@ mac-relay 可以同时跑在多个中继服务器上，例如 box 上经 Tailsca
 
 | 组件 | 配置 | 多通道时的行为 |
 |---|---|---|
-| `relay-send` | `RELAY_URL`（主）、`RELAY_FALLBACK_URL`（逗号分隔，按顺序） | 发到第一个能入队的通道。`RELAY_HANDOFF_S`（默认 20 秒）内 Mac 没接单，就把同一个任务 id 发到下一个通道，并在前一个通道上撤回（仍在排队时）。总等待 `RELAY_STARTED_WAIT_S`（默认 45 秒），轮询所有发过的通道。 |
-| `relay-box-agent` | 同上 | 同时长轮询每个通道的 `/results/next`。同一任务 id 只交付一次（下载文件、写 `result.json`、唤醒一次），来自其他通道的副本只 ack。 |
-| Mac worker | `worker.json` 的 `endpoints`（有序列表，第一个为主） | 同时长轮询每个通道的 `/tasks/next`。结果先回到接单的通道（主优先）；这些通道连续失败 `mirror_after_s`（默认 60 秒）后，把任务镜像到其他通道并在那里交付。 |
+| `relay-send` | `RELAY_URL`（主）、`RELAY_FALLBACK_URL`（逗号分隔，按顺序）、`RELAY_BIG_BYTES`（默认 8 MiB） | 发到第一个能入队的通道。合计 `--file` 超过 `RELAY_BIG_BYTES` 时，先走 `RELAY_FALLBACK_URL` 里的公网地址（第一个 https 备用，没有 https 则用第一个备用）；这条发不出去再按原来的顺序试其他通道。`RELAY_HANDOFF_S`（默认 20 秒）内 Mac 没接单，就把同一个任务 id 发到下一个通道，并在前一个通道上撤回（仍在排队时）。总等待 `RELAY_STARTED_WAIT_S`（默认 45 秒），轮询所有发过的通道。 |
+| `relay-box-agent` | 同上 | 同时长轮询每个通道的 `/results/next`。同一任务 id 只交付一次（下载文件、写 `result.json`、唤醒一次）。超过 `RELAY_BIG_BYTES` 时，若已配置的公网端点上有同一份完整文件，就从那里下载，否则用交出事件的通道。ack 回到事件通道。来自其他通道的副本只 ack。 |
+| Mac worker | `worker.json` 的 `endpoints`（有序列表，第一个为主）；可选 `public_endpoint`、`big_bytes` | 同时长轮询每个通道的 `/tasks/next`。结果先回到接单的通道（主优先）。结果文件合计超过 `big_bytes`（默认 8 MiB，或 `RELAY_BIG_BYTES`）时，先走公网通道（第一个 https 端点，或配置里的 `public_endpoint`），需要的话立刻镜像，不等 `mirror_after_s`。原通道连续失败 `mirror_after_s`（默认 60 秒）后，再镜像到其他通道交付。 |
 
 通道状态变化只记一次日志：`channel <name> down: …` / `channel <name> recovered after N s`。连接错误、超时、HTTP 5xx 记为 down；下一次请求成功即恢复，无需手动重置。
 
@@ -43,9 +43,10 @@ Mac（`worker.json`）：
 
 ## 大文件
 
-- **结果（Mac → box）。** 分块 `PUT …?offset=&total=&sha256=`（8 MiB）。服务器保留 `.upload` 半成品；offset 不对返回 `409 {"partial": n}`；文件对外可见前校验 sha256（不符返回 `422` 并删除半成品）。`GET /uploads/{id}/{name}?kind=` 返回续传点，断线、worker 重启、服务器重启后都能续传。发送方卡住但不断开时，`RELAY_CHUNK_STALL_S`（默认 30 秒）后释放。续传点比上一次大说明通道慢但在工作，会重置镜像计时，不会为它放弃慢通道。
+- **结果（Mac → box）。** 分块 `PUT …?offset=&total=&sha256=`（8 MiB）。服务器保留 `.upload` 半成品；offset 不对返回 `409 {"partial": n}`；文件对外可见前校验 sha256（不符返回 `422` 并删除半成品）。`GET /uploads/{id}/{name}?kind=` 返回续传点，断线、worker 重启、服务器重启后都能续传。发送方卡住但不断开时，`RELAY_CHUNK_STALL_S`（默认 30 秒）后释放锁，并返回 `400 {"error":"short body","partial":N}`，已写入的字节保留。客户端在同一次上传里从 N 续传（N 必须是整数，且落在刚发送的 offset 和文件大小之间）。N 没有前进时最多再试两次，然后放弃这条通道。一整块 8 MiB 比常见 TCP 窗口大：如果对端已经回了 409 或这个 400 并且不再读正文，客户端会读这份响应并重试这一块，而不是把发送堵到 stall 超时。一直 `busy` 的 409 试几次后放弃这条通道。其他 400（`bad name`、`bad offset/total`，或不是这份 JSON）仍是致命错误。续传点比上一次大说明通道慢但在工作，会重置镜像计时，不会为它放弃慢通道。
 - **下载（box-agent、worker 附件）。** 先写 `<name>.partial`，用 `Range` 续传，按服务器记录的大小和 sha256 校验后才改名，半成品永远不会以正式文件名出现。
-- **附件（box → Mac）。** v2 服务器上 `relay-send` 先以 `staged` 建任务，逐个分块 PUT `--file`，再 commit；全部附件完整且校验通过前任务不可被认领。旧服务器仍用 multipart（16 MiB 上限）。
+- **附件（box → Mac）。** v2 服务器上 `relay-send` 先以 `staged` 建任务，逐个分块 PUT `--file`，再 commit；全部附件完整且校验通过前任务不可被认领。旧服务器仍用 multipart（16 MiB 上限）。合计附件超过 `RELAY_BIG_BYTES`（默认 8 MiB）时，`relay-send` 先把任务发到备用列表里的公网地址。worker 下载这些附件时也优先走公网 https，即使它是从同一台服务器的另一条 URL（例如 VPS 的 tailnet 地址）接的单；中途切换通道可以从断点续传。
+- **大结果（Mac → box）。** 出箱（加上 stdout/stderr）超过 `big_bytes`（同一默认值）时，worker 先把结果传到公网 https 端点；若任务不是在那条通道上接的，会先镜像过去。这次上传没完成时，文件从另一条通道送出，公网那一行保持 `running`。worker 不会给它补一个不带文件的结果：`GET /tasks` 看不出 box-agent 是否已经 ack 了真正的结果，计时器也不能证明。那样一条空的 `done` 可能被晚启动的 box-agent 先取走，唤醒时没有文件。`running` 不会出现在 `/results/next`。要收回磁盘，在公网那台中继上手工删掉该任务行和 `files/<id>/`，不要用空结果去清。结果超过 `RELAY_BIG_BYTES` 时，box-agent 只在已配置的公网端点上、并且每个文件都已完整且大小和 sha256 一致时，才从那里下载；否则用交出这个事件的通道。不会再试其他端点。ack 回到事件通道，第二份副本只唤醒一次。`worker.json` 的 `public_endpoint` 可覆盖“选 https”的规则（loopback 自测没有 TLS 时用）。
 - **长 prompt。** `relay-send … -` 从 stdin 读，`--prompt-file` 从文件读。worker 对超过 `stdin_prompt_over[tool]` 字节的 prompt 改走 stdin（prompt 参数为 `"-"`），不放 argv。
 
 ## 协议 v2 与旧服务器

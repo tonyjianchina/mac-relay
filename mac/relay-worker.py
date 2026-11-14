@@ -11,10 +11,17 @@ At most once: the task directory is the ledger. The first claim of a task id wri
 task.json under a lock; a later claim of the same id from any channel (redelivery, or the
 same task posted to two servers) is confirmed but never run again.
 
-Results go back to the channel(s) the task was claimed from, primary first. If none of them
-accepts the result for `mirror_after_s` (default 60), the worker mirrors the task onto
-another channel (POST /tasks {"mirror":true}) and returns the result there; box agents
-consume every channel and dedupe by task id.
+Results go back to the channel(s) the task was claimed from, primary first. If the result
+files together exceed `big_bytes` (default 8 MiB, or RELAY_BIG_BYTES), they go to the public
+channel first (the first https endpoint, or `public_endpoint` in the config) — the task is
+mirrored there if it was not claimed on that channel. A 400 short body with a partial offset
+resumes in the same attempt; other 400s stay fatal. If that public upload does not finish
+and another channel takes the files, the public row is left running. It is not marked done
+with an empty result: nothing the worker can read proves the box-agent has already taken
+the real one, and that empty done could be delivered instead. If none of the origins accepts
+the result for `mirror_after_s`
+(default 60), the worker mirrors the task onto another channel (POST /tasks {"mirror":true})
+and returns the result there; box agents consume every channel and dedupe by task id.
 
 Files: outputs (stdout, stderr, everything under the outbox, recursively, keeping relative
 paths) are uploaded with chunked, resumable PUTs (8 MiB, sha256 checked by the server) on
@@ -22,11 +29,15 @@ servers that support it, and one streaming PUT on old servers. Attachments are d
 with Range resume and checked against the sha256 the sender supplied. Every request has a
 hard deadline and a stall watchdog. Acceptance (/started) is confirmed before attachments
 are downloaded, so a large input does not hold the sender's started wait.
+Big attachments are fetched from the public https endpoint first (the same
+`public_endpoint` / first-https rule as big results), so a claim on a slow
+URL of the same server still uses the fast path and can resume mid-file.
 
-One task's upload failure does not stop the others. HTTP 4xx (other than 404 unknown task)
-counts toward upload_4xx_quarantine (default 3): a quarantine marker is written and the files
-stay. Test hook: `prompt_routes` [{"prefix": "...", "tool": "..."}] runs another configured
-tool when a prompt starts with that prefix (used for the deterministic selftest tool)."""
+One task's upload failure does not stop the others. HTTP 4xx (other than 404 unknown task
+and a validated 400 short body) counts toward upload_4xx_quarantine (default 3): a quarantine
+marker is written and the files stay. Test hook: `prompt_routes` [{"prefix": "...", "tool": "..."}]
+runs another configured tool when a prompt starts with that prefix (used for the deterministic
+selftest tool)."""
 import json, os, re, signal, subprocess, sys, threading, time, urllib.error
 
 def log(*a):
@@ -35,7 +46,7 @@ def log(*a):
 # --- BEGIN mac-relay net (keep identical to the copy in mac/relay-worker.py; tests check) ---
 # Stdlib HTTP for mac-relay clients: hard deadlines, stall detection, chunked resumable
 # upload with sha256, resumable verified download. Shared by box tools and the Mac worker.
-import hashlib, http.client, json, os, socket, threading, time, urllib.error, urllib.parse, urllib.request
+import hashlib, http.client, json, os, select, socket, ssl, threading, time, urllib.error, urllib.parse, urllib.request
 
 CHUNK_BYTES = 8 * 1024 * 1024
 
@@ -87,6 +98,148 @@ class _Reg(threading.local):
         self.conns = []
 
 
+def _note_early(conn, exc):
+    """If the server answered and closed while the body was still uploading, keep that
+    response on the OSError. urllib otherwise turns the reset into URLError and drops it."""
+    try:
+        sock = conn.sock
+        if sock is None:
+            return
+        sock.settimeout(1)
+        resp = conn.getresponse()
+        body = resp.read(65536)
+        if int(resp.status) < 400:
+            return
+        exc.early_status = int(resp.status)
+        exc.early_reason = resp.reason if isinstance(resp.reason, str) else ""
+        exc.early_body = bytes(body or b"")
+    except Exception:
+        return
+
+
+def _early_response(exc):
+    """(status, reason, body) stashed by _note_early, walking URLError.reason / __context__."""
+    cur, seen = exc, set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        status = getattr(cur, "early_status", None)
+        if isinstance(status, int):
+            body = getattr(cur, "early_body", b"") or b""
+            reason = getattr(cur, "early_reason", "") or ""
+            return status, str(reason), body
+        nxt = getattr(cur, "reason", None)
+        if not isinstance(nxt, BaseException):
+            nxt = getattr(cur, "__context__", None)
+        if not isinstance(nxt, BaseException) or nxt is cur:
+            return None
+        cur = nxt
+    return None
+
+
+class _PeerAnswered(Exception):
+    """The peer sent an HTTP error before the request body finished."""
+    def __init__(self, status, reason, body):
+        super().__init__(status)
+        self.early_status, self.early_reason, self.early_body = status, reason, body
+
+
+class _EarlyBody:
+    """Send a request body without deadlocking if the peer answers first.
+
+    A full 8MiB chunk does not fit in a typical TCP window. If the server or a
+    proxy replies (409 busy, 400 short body) and stops reading, a blocking
+    send waits until the stall watchdog. Polling for a readable socket lets
+    the HTTP error be handled, and the chunk retried, instead.
+    """
+    def _read_answered(self):
+        sock = self.sock
+        if sock is None:
+            return None
+        try:
+            sock.settimeout(1)
+            resp = self.getresponse()
+            body = resp.read(65536)
+        except Exception:
+            return None
+        if int(resp.status) < 400:
+            return None
+        reason = resp.reason if isinstance(resp.reason, str) else ""
+        return int(resp.status), reason, bytes(body or b"")
+
+    def _send_body(self, body):
+        sock = self.sock
+        if sock is None:
+            raise ConnectionError("no socket")
+        prev = sock.gettimeout()
+        sock.setblocking(False)
+        try:
+            pending = b""
+            while True:
+                if not pending:
+                    pending = body.read(self.blocksize)
+                    if not pending:
+                        return
+                try:
+                    n = sock.send(pending)
+                except ssl.SSLWantReadError:
+                    got = self._read_answered()
+                    if got:
+                        raise _PeerAnswered(*got)
+                    continue
+                except ssl.SSLWantWriteError:
+                    readable, _ = _poll_send(sock)
+                    if readable:
+                        got = self._read_answered()
+                        if got:
+                            raise _PeerAnswered(*got)
+                    continue
+                except BlockingIOError:
+                    readable, _ = _poll_send(sock)
+                    if readable:
+                        got = self._read_answered()
+                        if got:
+                            raise _PeerAnswered(*got)
+                    continue
+                if not n:
+                    raise ConnectionError("upload socket closed")
+                pending = pending[n:]
+        finally:
+            try:
+                sock.settimeout(prev)
+            except OSError:
+                pass
+
+    def _send_output(self, message_body=None, encode_chunked=False):
+        try:
+            # File bodies are polled so an early 4xx is not stuck behind an 8MiB send.
+            if message_body is not None and hasattr(message_body, "read") and not encode_chunked:
+                super()._send_output(None)
+                self._send_body(message_body)
+                return
+            super()._send_output(message_body, encode_chunked=encode_chunked)
+        except _PeerAnswered as e:
+            err = ConnectionError("peer answered before the upload body finished")
+            err.early_status, err.early_reason, err.early_body = e.early_status, e.early_reason, e.early_body
+            raise err from e
+        except OSError as e:
+            _note_early(self, e)
+            raise
+
+
+def _poll_send(sock):
+    """(readable, writable) with a short wait so a stall watchdog can still run."""
+    r, w, _ = select.select([sock], [sock], [], 0.25)
+    return sock in r, sock in w
+
+
+class _HTTPConn(_EarlyBody, http.client.HTTPConnection):
+    pass
+
+
+class _HTTPSConn(_EarlyBody, http.client.HTTPSConnection):
+    pass
+
+
 class _HTTP(urllib.request.HTTPHandler):
     def __init__(self, reg, src=None):
         super().__init__(); self.reg, self.src = reg, src
@@ -95,7 +248,7 @@ class _HTTP(urllib.request.HTTPHandler):
         def mk(host, **kw):
             if self.src:
                 kw["source_address"] = (self.src, 0)
-            c = http.client.HTTPConnection(host, **kw); self.reg.conns.append(c); return c
+            c = _HTTPConn(host, **kw); self.reg.conns.append(c); return c
         return self.do_open(mk, req)
 
 
@@ -105,7 +258,7 @@ class _HTTPS(urllib.request.HTTPSHandler):
 
     def https_open(self, req):
         def mk(host, **kw):
-            c = http.client.HTTPSConnection(host, **kw); self.reg.conns.append(c); return c
+            c = _HTTPSConn(host, **kw); self.reg.conns.append(c); return c
         return self.do_open(mk, req, context=self._context)
 
 
@@ -204,6 +357,13 @@ class Endpoint:
             (self._fail(e) if e.code >= 500 else self._ok())
             raise
         except Exception as e:
+            early = _early_response(e)
+            if early:
+                status, reason, raw = early
+                err = urllib.error.HTTPError(r.full_url, status, reason or "error", None, None)
+                err.relay_body = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+                (self._fail(err) if status >= 500 else self._ok())
+                raise err from e
             if w.fired:
                 e2 = TimeoutError(f"{self.name}: stalled or past deadline ({method} {path.split('?')[0]})")
                 self._fail(e2); raise e2 from e
@@ -259,10 +419,40 @@ class Mismatch(Exception):
     """Checksum or size verification failed; the partial data was discarded."""
 
 
+# How many times a 400 short body may come back without the resume point moving.
+# Progress (partial > offset just sent) is bounded by the file size, since the offset only grows.
+_SHORT_STALLS = 2
+# 409 busy means the previous request still holds the upload. Retry a few times, then
+# give up so the caller can use another channel instead of looping forever.
+_BUSY_TRIES = 4
+
+
+def _short_partial(err, size, sent):
+    """Resume offset for a validated 400 {"error":"short body","partial":N}, else None.
+
+    N must be an int (not a bool) and sent <= N <= size. A missing/malformed partial, a
+    different error (bad name, bad offset/total), or N < sent is not this case: the caller
+    raises and leaves fatal 400 handling unchanged. N == sent is valid but made no progress.
+    """
+    if getattr(err, "code", None) != 400:
+        return None
+    try:
+        j = json.loads(getattr(err, "relay_body", "") or "")
+    except ValueError:
+        return None
+    if not isinstance(j, dict) or j.get("error") != "short body" or "partial" not in j:
+        return None
+    p = j.get("partial")
+    if type(p) is not int or p < sent or p > size:
+        return None
+    return p
+
+
 def upload_file(ep, tid, kind, path, name, chunk=CHUNK_BYTES, stall=60, log=None):
     """Upload one file as `name` (may contain '/' on new servers). New servers: chunked PUT
     with offset; resumes from the server's partial size; the server checks sha256 before the
-    file becomes visible. Old servers: one streaming PUT. Returns {"name","size","sha256"}."""
+    file becomes visible. A 400 short body whose partial is in range resumes in this attempt.
+    Old servers: one streaming PUT. Returns {"name","size","sha256"}."""
     log = log or (lambda *a: None)
     size, sha = os.path.getsize(path), sha256_file(path)
     meta = {"name": name, "size": size, "sha256": sha}
@@ -279,6 +469,8 @@ def upload_file(ep, tid, kind, path, name, chunk=CHUNK_BYTES, stall=60, log=None
     reset = off > size
     if off and not reset:
         log("resume", tid, name, f"{off}/{size}", "on", ep.name)
+    stalls = 0  # consecutive short bodies that did not advance
+    busy = 0
     with open(path, "rb") as f:
         while True:
             if reset:
@@ -303,13 +495,30 @@ def upload_file(ep, tid, kind, path, name, chunk=CHUNK_BYTES, stall=60, log=None
                     except ValueError:
                         j = {}
                     off, reset = int(j.get("partial") or 0), False
+                    stalls = 0
                     if j.get("busy"):
-                        time.sleep(2)
+                        busy += 1
+                        if busy > _BUSY_TRIES:
+                            raise ConnectionError(f"{ep.name}: upload still busy") from e
+                        time.sleep(0.5)
+                    else:
+                        busy = 0
                     continue
+                p = _short_partial(e, size, off)
+                if p is not None and p > off:
+                    off, reset, stalls = p, False, 0
+                    log("resume", tid, name, f"{off}/{size}", "on", ep.name)
+                    continue
+                if p is not None:
+                    stalls += 1
+                    if stalls <= _SHORT_STALLS:
+                        continue
                 if e.code == 422:
                     raise Mismatch(f"{name}: server sha256 mismatch") from e
                 raise
             reset = False
+            stalls = 0
+            busy = 0
             if j.get("complete"):
                 return meta
             off = int(j.get("partial", off + n))
@@ -396,6 +605,40 @@ def _endpoints():
 EPS = _endpoints()
 BYNAME = {e.name: e for e in EPS}
 LEDGER = threading.Lock()
+
+def _big_bytes():
+    try:
+        return max(0, int(CFG.get("big_bytes", os.environ.get("RELAY_BIG_BYTES", 8 * 1024 * 1024))))
+    except (TypeError, ValueError):
+        return 8 * 1024 * 1024
+
+BIG_BYTES = _big_bytes()
+
+def public_ep():
+    """VPS public channel: CFG public_endpoint (name or URL), else the first https endpoint."""
+    want = CFG.get("public_endpoint")
+    if want:
+        if want in BYNAME:
+            return BYNAME[want]
+        for e in EPS:
+            if e.url.rstrip("/") == str(want).rstrip("/"):
+                return e
+    return next((e for e in EPS if e.url.lower().startswith("https://")), None)
+
+def files_total(files):
+    return sum(os.path.getsize(p) for p, _ in files if os.path.isfile(p))
+
+def attach_sources(tid, total=0):
+    """Download sources: public first when attachments are big or it is already an origin.
+    vps and vps-ts can be the same server; trying the public URL first avoids the slow
+    tailnet path after a claim on the tailnet URL."""
+    org = list(origins(tid))
+    pub = public_ep()
+    candidates = list(org)
+    if pub and pub not in candidates and total > BIG_BYTES:
+        candidates = [pub] + candidates
+    return sorted(candidates, key=lambda e: (not e.healthy(), e is not pub))
+
 PROCS, PREP, DELIVERING, NEXT_TRY, FAIL_SINCE = {}, set(), set(), {}, {}
 
 def tdir(tid, *p):
@@ -476,6 +719,16 @@ def prep(tid):
         inbox = tdir(tid, "in")
         meta = {m.get("name"): m for m in task.get("attachments_meta") or [] if isinstance(m, dict)}
         end, backoff = time.time() + ATTACH_DEADLINE, 2
+        total = 0
+        for n in task.get("attachments") or []:
+            m = meta.get(n, {})
+            try:
+                total += int(m.get("size") or 0)
+            except (TypeError, ValueError):
+                pass
+        srcs = attach_sources(tid, total)
+        if srcs:
+            log("attach", tid, total, "bytes via", ",".join(e.name for e in srcs))
         for n in task.get("attachments") or []:
             rel = safe_rel(n)
             if not rel:
@@ -484,9 +737,10 @@ def prep(tid):
             m = meta.get(n, {})
             while not os.path.exists(dest):
                 err = None
-                for ep in sorted(origins(tid), key=lambda e: not e.healthy()):
+                for ep in srcs:
                     try:
                         download_file(ep, tid, "in", n, dest, m.get("size"), m.get("sha256"))
+                        log("downloaded", tid, n, "via", ep.name)
                         break
                     except Exception as e:
                         err = e
@@ -597,24 +851,107 @@ class Fatal4xx(Exception):
     def __init__(self, ep, code, body):
         super().__init__(f"{code} {body[:300]}"); self.ep, self.code, self.body = ep, code, body
 
+def _short_body(e):
+    """True only for 400 {"error":"short body","partial":N} with N a non-negative int.
+    Missing, negative, or non-integer partial stays a fatal 400, as do bad name and bad offset."""
+    if getattr(e, "code", None) != 400:
+        return False
+    try:
+        j = json.loads(getattr(e, "relay_body", "") or "")
+    except ValueError:
+        return False
+    if not isinstance(j, dict) or j.get("error") != "short body" or "partial" not in j:
+        return False
+    p = j.get("partial")
+    return type(p) is int and p >= 0
+
+def _fatal_4xx(e):
+    """(fatal, body). 404 unknown task and a validated short body fall through; other 4xx do not."""
+    body = (getattr(e, "relay_body", "") or "").replace("\n", " ")
+    if e.code == 404 and "unknown task" in body:
+        return False, body
+    if _short_body(e):
+        return False, body
+    return (400 <= e.code < 500), body
+
+def _schedule_closeout(tid, eps, status, summary):
+    """Remember channels that still show this task as running. Does not touch any other task."""
+    names = []
+    for e in eps:
+        if e is not None and e.name not in names:
+            names.append(e.name)
+    if not names:
+        return
+    p = tdir(tid, "closeout.json")
+    try:
+        c = json.load(open(p))
+    except (OSError, ValueError):
+        c = {}
+    have = [n for n in (c.get("eps") or []) if isinstance(n, str)]
+    for n in names:
+        if n not in have:
+            have.append(n)
+    c["eps"] = have
+    c["status"] = status
+    c["summary"] = summary
+    if not c.get("after"):
+        c["after"] = time.time() + CLOSEOUT_AFTER
+    _write(p, json.dumps(c))
+
 def deliver(tid, status, summary, files):
-    """Origins first (healthy ones first); after MIRROR_AFTER of failures, other channels."""
+    """Origins first (healthy ones first); after MIRROR_AFTER of failures, other channels.
+    Results larger than big_bytes go to the public channel first, without waiting.
+    A public attempt that does not finish is left running. GET /tasks does not include the
+    delivery ack, so a file-less done on that row is not a safe cleanup."""
     last = None
-    org = origins(tid)
-    for ep in sorted(org, key=lambda e: not e.healthy()):
+    pub = public_ep()
+    pub_open = False  # this task exists on pub and did not get a finished result there
+    if pub and files_total(files) > BIG_BYTES:
         try:
-            upload_result(ep, tid, status, summary, files); return ep.name
+            if pub not in origins(tid):
+                log("big-result", tid, files_total(files), "bytes mirror ->", pub.name)
+                mirror(pub, tid); add_origin(tid, pub)
+            else:
+                log("big-result", tid, files_total(files), "bytes ->", pub.name)
+            pub_open = True
+            upload_result(pub, tid, status, summary, files)
+            org = [o for o in origins(tid) if o is not pub]
+            if org:
+                _schedule_closeout(tid, org, status, f"{summary} [result files delivered via {pub.name}]")
+            return pub.name
         except urllib.error.HTTPError as e:
-            body = (getattr(e, "relay_body", "") or "").replace("\n", " ")
+            fatal, body = _fatal_4xx(e)
+            if fatal:
+                raise Fatal4xx(pub.name, e.code, body) from e
+            last = e
+            log("big-result", tid, "public failed:", type(e).__name__, e.code, str(e)[:160], "- falling back")
+        except Exception as e:
+            last = e
+            log("big-result", tid, "public failed:", type(e).__name__, str(e)[:200], "- falling back")
+    held = origins(tid)
+    # Same attempt: do not immediately repeat a public upload that just failed. A later
+    # sweep starts deliver() over and probes the partial again.
+    retry = [e for e in held if not (pub_open and e is pub)]
+    for ep in sorted(retry, key=lambda e: not e.healthy()):
+        try:
+            upload_result(ep, tid, status, summary, files)
+            if pub_open and ep is not pub:
+                # Running rows are not offered on /results/next. An empty done would be, and a
+                # box-agent that was down can take it before the channel that has the files.
+                log("public partial left", tid, "on", pub.name,
+                    "- still running; not posting an empty result")
+            return ep.name
+        except urllib.error.HTTPError as e:
+            fatal, body = _fatal_4xx(e)
             if e.code == 404 and "unknown task" in body:
                 log("result", tid, "unknown on", ep.name, "- not an origin"); drop_origin(tid, ep); last = e; continue
-            if 400 <= e.code < 500:
+            if fatal:
                 raise Fatal4xx(ep.name, e.code, body) from e
             last = e
         except Exception as e:
             last = e
     since = FAIL_SINCE.setdefault(tid, time.time())
-    others = [e for e in EPS if e not in org]
+    others = [e for e in EPS if e not in held]
     if others and time.time() - since >= MIRROR_AFTER:
         for ep in sorted(others, key=lambda e: not e.healthy()):
             try:
@@ -623,9 +960,13 @@ def deliver(tid, status, summary, files):
                 upload_result(ep, tid, status, summary, files)
                 # The origins still hold the task as running. Close them later with a file-less
                 # result; by then the box-agent has the mirrored copy and only acks the closeout.
-                _write(tdir(tid, "closeout.json"), json.dumps({
-                    "eps": [o.name for o in org], "after": time.time() + CLOSEOUT_AFTER,
-                    "status": status, "summary": f"{summary} [result files delivered via {ep.name}]"}))
+                # An abandoned public partial is not one of those: it never got the files, and an
+                # empty done there can be delivered in their place.
+                stale = [o.name for o in held if o is not ep and not (pub_open and o is pub)]
+                if stale:
+                    _write(tdir(tid, "closeout.json"), json.dumps({
+                        "eps": stale, "after": time.time() + CLOSEOUT_AFTER,
+                        "status": status, "summary": f"{summary} [result files delivered via {ep.name}]"}))
                 return ep.name
             except Exception as e:
                 last = e

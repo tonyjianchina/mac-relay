@@ -8,16 +8,20 @@ plus the .wake marker (at-most-once) mean the same task delivered over two chann
 sender once; the second copy is only acked.
 
 Files are downloaded to <results>/<id>/<relative path> through .partial files with Range
-resume, and checked against the size and sha256 the server reports (files_meta). result.json is
-written only after every file is complete, then one wake. A failed download is not acked, so
-the result is offered again and resumes. status=started is never sent to the sender webhook;
+resume, and checked against the size and sha256 the server reports (files_meta). A result
+larger than RELAY_BIG_BYTES is fetched from the configured public endpoint when that
+endpoint already has every file complete with the same size and sha256; otherwise from the
+channel that offered the event. No other endpoint is tried. The ack always goes to the event
+channel. result.json is written only after every file is complete, then one wake. A failed
+download is not acked, so the result is offered again and resumes. status=started is never
+sent to the sender webhook;
 a stale started event is acked and .wake-started is written as skipped/no-webhook.
 Env: RELAY_URL, RELAY_SECRET_FILE, RELAY_RESULTS_DIR (/workspace/relay-results),
 RELAY_WAKE_DIR (/workspace/relay/wake), RELAY_FALLBACK_URL, RELAY_AGENT_PARALLEL (4).
 Run under nohup/supervisor; not a cron job."""
 import json, os, sys, threading, time, urllib.parse, urllib.request
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
-from relay.client import endpoints_from_env, secret
+from relay.client import big_bytes, endpoints_from_env, public_endpoint, secret
 from relay.net import download_file, qseg, safe_rel
 
 RES = os.environ.get("RELAY_RESULTS_DIR", "/workspace/relay-results")
@@ -53,6 +57,57 @@ def wake(t, rdir):
 def ack(ep, sec, tid, body=b"{}"):
     ep.call("POST", f"/results/{qseg(tid)}/ack", body, "application/json", deadline=30)
 
+def _meta_map(t):
+    return {m.get("name"): m for m in (t.get("files_meta") or []) if isinstance(m, dict)}
+
+def _same_files(ep, tid, files, meta):
+    """True when this configured endpoint has each result file, complete, same size and sha256.
+    A miss, a different checksum, or any error means the endpoint does not hold this copy."""
+    if not files:
+        return False
+    for n in files:
+        m = meta.get(n) or {}
+        sha = m.get("sha256")
+        try:
+            size = int(m.get("size"))
+        except (TypeError, ValueError):
+            return False
+        if not sha:
+            return False
+        try:
+            st, j = ep.json("GET", f"/uploads/{qseg(tid)}/{qseg(n)}?kind=out", deadline=20, stall=15)
+        except Exception:
+            return False
+        if st != 200 or not isinstance(j, dict) or not j.get("complete"):
+            return False
+        try:
+            got = int(j.get("size"))
+        except (TypeError, ValueError):
+            return False
+        if got != size or str(j.get("sha256") or "").lower() != str(sha).lower():
+            return False
+    return True
+
+def download_sources(t, event_ep):
+    """Where to GET a result. Large results try the configured public endpoint first, and
+    only when it has these same files. The event channel is the fallback. Nothing else."""
+    files = list(t.get("files") or [])
+    meta = _meta_map(t)
+    total = 0
+    for n in files:
+        try:
+            total += int((meta.get(n) or {}).get("size") or 0)
+        except (TypeError, ValueError):
+            return [event_ep]
+    if total <= big_bytes():
+        return [event_ep]
+    pub = public_endpoint(EPS)
+    if pub is None or pub is event_ep:
+        return [event_ep]
+    if _same_files(pub, t.get("id") or "", files, meta):
+        return [pub, event_ep]
+    return [event_ep]
+
 def handle(sec, t, ep=None):
     ep = ep or EPS[0]
     tid = t["id"]
@@ -70,16 +125,27 @@ def handle(sec, t, ep=None):
         if os.path.exists(marker):
             log("duplicate", tid, "via", ep.name, "- already delivered, ack only")
         else:
-            meta = {m.get("name"): m for m in t.get("files_meta") or [] if isinstance(m, dict)}
-            paths, t0, total = [], time.time(), 0
-            for n in t["files"]:
-                rel = safe_rel(n)
-                if not rel:
-                    log("ERROR unsafe file name from relay", tid, repr(n)); continue
-                p = os.path.join(rdir, *rel.split("/"))
-                m = meta.get(n, {})
-                total += download_file(ep, tid, "out", n, p, m.get("size"), m.get("sha256"))
-                paths.append(p)
+            meta = _meta_map(t)
+            files = list(t.get("files") or [])
+            sources = download_sources(t, ep)
+            paths, total, src, t0 = [], 0, sources[0], time.time()
+            for i, cand in enumerate(sources):
+                paths, total = [], 0
+                try:
+                    for n in files:
+                        rel = safe_rel(n)
+                        if not rel:
+                            log("ERROR unsafe file name from relay", tid, repr(n)); continue
+                        p = os.path.join(rdir, *rel.split("/"))
+                        m = meta.get(n) or {}
+                        total += download_file(cand, tid, "out", n, p, m.get("size"), m.get("sha256"))
+                        paths.append(p)
+                    src = cand
+                    break
+                except Exception as e:
+                    if i == len(sources) - 1:
+                        raise
+                    log("download", tid, "via", cand.name, type(e).__name__, str(e)[:160], "- next source")
             res = {"task_id": tid, "sender": t["sender"], "tool": t["tool"], "status": t["status"],
                    "summary": t["summary"], "files": paths}
             tmp = os.path.join(rdir, "result.json.tmp")
@@ -87,7 +153,8 @@ def handle(sec, t, ep=None):
             open(marker, "w").write("attempting\n")  # at-most-once: written BEFORE the POST
             r = wake(t, rdir)
             open(marker, "w").write(r + "\n")
-            log("delivered", tid, t["status"], "via", ep.name, f"{len(paths)} files {total} bytes",
+            log("delivered", tid, t["status"], "via", ep.name, "from", src.name,
+                f"{len(paths)} files {total} bytes",
                 f"{time.time() - t0:.1f}s", "verified" if meta else "size-checked", "wake:", r)
         ack(ep, sec, tid)
 
