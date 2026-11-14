@@ -16,8 +16,10 @@ files together exceed `big_bytes` (default 8 MiB, or RELAY_BIG_BYTES), they go t
 channel first (the first https endpoint, or `public_endpoint` in the config) — the task is
 mirrored there if it was not claimed on that channel. A 400 short body with a partial offset
 resumes in the same attempt; other 400s stay fatal. If that public upload does not finish
-and another channel then takes the full result, the abandoned public row is closed out
-later with a file-less result. If none of the origins accepts the result for `mirror_after_s`
+and another channel takes the files, the public row is left running. It is not marked done
+with an empty result: nothing the worker can read proves the box-agent has already taken
+the real one, and that empty done could be delivered instead. If none of the origins accepts
+the result for `mirror_after_s`
 (default 60), the worker mirrors the task onto another channel (POST /tasks {"mirror":true})
 and returns the result there; box agents consume every channel and dedupe by task id.
 
@@ -803,8 +805,8 @@ def _schedule_closeout(tid, eps, status, summary):
 def deliver(tid, status, summary, files):
     """Origins first (healthy ones first); after MIRROR_AFTER of failures, other channels.
     Results larger than big_bytes go to the public channel first, without waiting.
-    If that attempt fails and another channel accepts the files, the public row is closed
-    out later (file-less) so an abandoned partial does not stay running."""
+    A public attempt that does not finish is left running. GET /tasks does not include the
+    delivery ack, so a file-less done on that row is not a safe cleanup."""
     last = None
     pub = public_ep()
     pub_open = False  # this task exists on pub and did not get a finished result there
@@ -838,8 +840,10 @@ def deliver(tid, status, summary, files):
         try:
             upload_result(ep, tid, status, summary, files)
             if pub_open and ep is not pub:
-                _schedule_closeout(tid, [pub], status,
-                                   f"{summary} [files delivered via {ep.name}; this copy has none]")
+                # Running rows are not offered on /results/next. An empty done would be, and a
+                # box-agent that was down can take it before the channel that has the files.
+                log("public partial left", tid, "on", pub.name,
+                    "- still running; not posting an empty result")
             return ep.name
         except urllib.error.HTTPError as e:
             fatal, body = _fatal_4xx(e)
@@ -860,10 +864,13 @@ def deliver(tid, status, summary, files):
                 upload_result(ep, tid, status, summary, files)
                 # The origins still hold the task as running. Close them later with a file-less
                 # result; by then the box-agent has the mirrored copy and only acks the closeout.
-                stale = [o.name for o in held if o is not ep]
-                _write(tdir(tid, "closeout.json"), json.dumps({
-                    "eps": stale, "after": time.time() + CLOSEOUT_AFTER,
-                    "status": status, "summary": f"{summary} [result files delivered via {ep.name}]"}))
+                # An abandoned public partial is not one of those: it never got the files, and an
+                # empty done there can be delivered in their place.
+                stale = [o.name for o in held if o is not ep and not (pub_open and o is pub)]
+                if stale:
+                    _write(tdir(tid, "closeout.json"), json.dumps({
+                        "eps": stale, "after": time.time() + CLOSEOUT_AFTER,
+                        "status": status, "summary": f"{summary} [result files delivered via {ep.name}]"}))
                 return ep.name
             except Exception as e:
                 last = e

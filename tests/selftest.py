@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Loopback end-to-end self-test. Writes TESTS.md. Usage: python3 tests/selftest.py [--quick]"""
-import json, os, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time, hashlib
+import json, os, signal, socket, sqlite3, ssl, subprocess, sys, tempfile, threading, time, hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUICK = "--quick" in sys.argv
@@ -542,6 +542,80 @@ def _():
     assert any(f"short-bound-1/files/bound.bin" in ln and f"offset={at}" in ln and " 200 " in ln for ln in lines)
     return f"mid-chunk kept bytes, resumed from {mid[0]}; sixth chunk 400 at {at} then retried there"
 
+def _tls_bridge(http_port, tls_port, cert, key):
+    """Terminate a disposable localhost cert and splice the plaintext onto the relay."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", tls_port)); ls.listen(32)
+    def pump(src, dst):
+        try:
+            while True:
+                b = src.recv(65536)
+                if not b:
+                    break
+                dst.sendall(b)
+        except OSError:
+            pass
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+    def one(raw):
+        try:
+            tls = ctx.wrap_socket(raw, server_side=True)
+            up = socket.create_connection(("127.0.0.1", http_port))
+        except OSError:
+            try:
+                raw.close()
+            except OSError:
+                pass
+            return
+        a = threading.Thread(target=pump, args=(tls, up), daemon=True)
+        b = threading.Thread(target=pump, args=(up, tls), daemon=True)
+        a.start(); b.start(); a.join(); b.join()
+        for s in (tls, up):
+            try:
+                s.close()
+            except OSError:
+                pass
+    def loop():
+        while True:
+            c, _ = ls.accept()
+            threading.Thread(target=one, args=(c,), daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
+
+@test("TLS interrupted chunk resumes from the kept partial")
+def _():
+    cert, key = os.path.join(T, "localhost-test.crt"), os.path.join(T, "localhost-test.key")
+    made = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes",
+                           "-keyout", key, "-out", cert, "-subj", "/CN=localhost",
+                           "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"], capture_output=True)
+    assert made.returncode == 0, made.stderr.decode()[:300]
+    tp = port(); _tls_bridge(PORT, tp, cert, key)
+    tid, name, n = "tls-short-1", "tls.bin", 3 * 1024 * 1024
+    assert api("POST", "/tasks", json.dumps({"id": tid, "sender": "alpha", "tool": "hermes", "prompt": "tls",
+                                             "mirror": True}).encode(), "application/json")[0] == 201
+    path = os.path.join(T, name); fill(path, n); want = sha_file(path)
+    trust = ssl.create_default_context(); trust.load_verify_locations(cert)
+    old_ctx, logs, orig = ssl._create_default_https_context, [], _stall_after(1024 * 1024 + 65536)
+    ssl._create_default_https_context = lambda: trust
+    try:
+        ep = NET.Endpoint(f"https://127.0.0.1:{tp}", open(SECRET).read().strip(), "tls")
+        m = NET.upload_file(ep, tid, "out", path, name, log=lambda *a: logs.append(a))
+    finally:
+        ssl._create_default_https_context = old_ctx
+        NET._Body.read = orig
+    assert m["sha256"] == want
+    offs = [int(str(a[3]).split("/")[0]) for a in logs if a and a[0] == "resume"]
+    assert offs and min(offs) >= 1024 * 1024 and max(offs) < n, offs
+    got, gn = sha_get(f"/files/{tid}/out/{name}")
+    assert got == want and gn == n
+    lines = open(f"{T}/server.log").read().splitlines()
+    assert any("tls-short-1" in ln and " 400 " in ln for ln in lines)
+    api("POST", f"/results/{tid}/ack", b"{}", "application/json")
+    return f"localhost TLS stall resumed from {offs[0]}"
+
 def scripted_upload(responses):
     """Tiny relay: scripted PUT status per file name. GET /uploads is an empty partial."""
     hits, p = {}, port()
@@ -974,7 +1048,7 @@ def _():
             os.environ["RELAY_BIG_BYTES"] = prev
         kill("vpsdl")
 
-@test("public short-body gives up and origin delivers; abandoned public row is closed out")
+@test("late box-agent gets the files once; abandoned public row is not an empty done")
 def _():
     kill("worker"); kill("agent")
     sp = port()
@@ -1022,32 +1096,39 @@ def _():
             pass
     threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", sp), H).serve_forever, daemon=True).start()
     cfg = wcfg(URL, "worker-close.json", state_dir_name="mac-state-close",
-               public_endpoint="fallback", big_bytes=100, fallback=f"http://127.0.0.1:{sp}")
+               public_endpoint="fallback", big_bytes=100, fallback=f"http://127.0.0.1:{sp}",
+               closeout_after_s=1)
     try:
-        worker(cfg); agent()
+        worker(cfg)  # box-agent stays down past closeout_after_s
         p = run_send({"RELAY_URL": URL}, "alpha", "hermes", "media please")
         assert p.returncode == 0 and "via primary" in p.stderr, p.stderr
         tid = p.stdout.strip()
         wait_log("worker", f"uploaded {tid} done", 40)
-        r = wait_result(tid, 40); expect_wakes(tid, "alpha")
-        assert os.path.getsize(os.path.join(RES, tid, "clip.mp4")) > 200_000
-        assert puts.get("stdout.txt") == 1 + NET._SHORT_STALLS, puts
-        assert max(puts.values()) <= 1 + NET._SHORT_STALLS, puts
+        time.sleep(3)  # longer than closeout_after_s=1; a timer must not invent an empty done
+        assert results == [], results
         wlog = open(f"{T}/worker.log").read()
         assert any(f"big-result {tid}" in ln and "public failed:" in ln and "HTTPError" in ln and " 400 " in ln
                    for ln in wlog.splitlines()), wlog[-1500:]
         assert f"uploaded {tid} done" in wlog and "via primary" in wlog
+        assert f"public partial left {tid} on fallback" in wlog
+        assert f"closeout {tid}" not in wlog
         assert f"upload error {tid}" not in wlog
         root = os.path.join(T, "mac-state-close", "tasks", tid)
         assert not os.path.exists(os.path.join(root, "quarantine"))
         assert not os.path.exists(os.path.join(root, "upload-4xx"))
-        wait_log("worker", f"closeout {tid} on fallback", 20)
-        assert f"closeout {tid} on primary" not in open(f"{T}/worker.log").read()
-        assert results and all(item.get("files") == [] for item in results), results
+        assert not os.path.exists(os.path.join(root, "closeout.json"))
+        assert puts.get("stdout.txt") == 1 + NET._SHORT_STALLS, puts
+        assert max(puts.values()) <= 1 + NET._SHORT_STALLS, puts
+        agent()
+        r = wait_result(tid, 40); expect_wakes(tid, "alpha")
+        assert r["files"] and os.path.getsize(os.path.join(RES, tid, "clip.mp4")) > 200_000
+        assert "this copy has none" not in (r.get("summary") or "")
+        time.sleep(2)
+        assert results == [], results
+        expect_wakes(tid, "alpha")
         task = json.loads(api("GET", f"/tasks/{tid}")[1])["task"]
         assert task["state"] == "done" and task["files"], task
-        expect_wakes(tid, "alpha")
-        return f"public stopped after {puts.get('stdout.txt')} short bodies; origin kept the files; public closeout had no files"
+        return f"agent started after closeout; public got no result POST; files delivered once ({puts.get('stdout.txt')} short bodies)"
     finally:
         if P.get("worker") and P["worker"].poll() is None:
             kill("worker")

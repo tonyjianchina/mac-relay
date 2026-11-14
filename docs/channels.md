@@ -82,9 +82,13 @@ two-entry list.
   VPS tailnet address), and can resume a mid-file download there.
 - **Big results (Mac to box).** If the outbox (plus stdout/stderr) is over `big_bytes` (same
   default), the worker uploads to the public https endpoint first, mirroring the task there when
-  it was claimed on another channel. If that upload does not finish and another channel accepts
-  the files, the worker posts a file-less result on the public row after `closeout_after_s`,
-  the same way it closes a stale origin. The box agent, for a result over `RELAY_BIG_BYTES`,
+  it was claimed on another channel. If that upload does not finish, the files go out on another
+  channel and the public row stays `running`. The worker does not POST a file-less result there.
+  `GET /tasks` does not show the box-agent's delivery ack, and a timer cannot prove the real
+  result was taken; that empty `done` can be the first event a restarted box-agent handles and
+  would wake the sender with no files. A `running` row is not offered on `/results/next`. To
+  reclaim the disk, remove that task's row and `files/<id>/` on the public relay by hand. Do not
+  clear it with an empty result. The box agent, for a result over `RELAY_BIG_BYTES`,
   downloads from the configured public endpoint only when that endpoint already has every file
   complete with the same size and sha256; otherwise it uses the channel that offered the event.
   It does not try any other endpoint. The ack goes to the event channel, and a second copy
