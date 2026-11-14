@@ -1,12 +1,22 @@
 {
-  "primary_url": "https://relay.example.com/relay",
-  "fallback_url": "http://100.64.0.1:18790",
+  "endpoints": [
+    {
+      "name": "box",
+      "url": "http://100.a.b.c:18790"
+    },
+    {
+      "name": "vps-ts",
+      "url": "http://100.x.y.z:18791"
+    },
+    {
+      "name": "vps",
+      "url": "https://relay.example.com/relay"
+    }
+  ],
   "secret_file": "~/.config/mac-relay/secret",
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
   "max_soft_file": 16777216,
-  "fail_threshold": 3,
-  "cooldown_s": 300,
   "max_backoff_s": 60,
   "tools": {
     "hermes": [
@@ -36,5 +46,9 @@
       "{prompt_file}"
     ]
   },
-  "fallback_source_ip": "100.x.y.z (this Mac's Tailscale IP; optional)"
+  "mirror_after_s": 60,
+  "closeout_after_s": 600,
+  "stdin_prompt_over": {
+    "codex": 100000
+  }
 }

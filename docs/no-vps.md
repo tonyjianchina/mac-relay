@@ -78,16 +78,11 @@ Clients join `base.rstrip("/") + path`. `path` is `/health`, `/tasks`, `/tasks/n
 
 ### Failover
 
-Failover is optional and only does something when a second base URL is set.
+Every component can use several relay servers at once. Box: `RELAY_URL` plus a comma-separated `RELAY_FALLBACK_URL`. Mac: an ordered `endpoints` list in `worker.json` (old `primary_url` / `fallback_url` still work). The worker long-polls all endpoints at once, `relay-box-agent` consumes results from all of them, and `relay-send` hands a task to the next channel when the Mac has not accepted it within `RELAY_HANDOFF_S`. There is no sticky mode, no `conn.json`, and no `reset-primary`; `fail_threshold`, `cooldown_s`, `RELAY_FAIL_THRESHOLD` and `RELAY_COOLDOWN_S` are ignored. A task id runs at most once (ledger on the Mac) and wakes once (`.wake` on the box).
 
-- Box: `RELAY_FALLBACK_URL`. Unset means there is no fallback. `relay-box-agent` switches after `RELAY_FAIL_THRESHOLD` consecutive primary failures (default 3). A failure is a connection error or an HTTP status ≥ 500. HTTP 4xx resets the failure count; it does not switch. The agent then stays on the fallback and probes `primary + /health` at most once per `RELAY_COOLDOWN_S` (default 300) before switching back. The mode is in memory; restart the agent and it starts on the primary. `relay-send` forces the threshold to 1 and, if that single failure switched it, retries the enqueue once on the fallback. Enqueue is idempotent on task id.
-- Mac worker: `fallback_url` in `worker.json`, with `fail_threshold` (default 3) and `cooldown_s` (default 300). Same sticky rule. The worker stores the mode in `<state_dir>/conn.json`. After a restart it keeps using the fallback until a probe succeeds, or until you `touch <state_dir>/reset-primary` or `kill -HUP <worker-pid>`. If you remove `fallback_url` but leave `conn.json` saying `"mode": "fallback"`, the next request looks up a missing URL. Delete `conn.json` or touch `reset-primary` when you go back to one URL.
+Requests to `100.x`, `*.ts.net`, `127.*` and `localhost` bypass `HTTP(S)_PROXY` and the macOS system proxy on every channel, primary included. A proxy that captures `100.64.0.0/10` at the OS level (a VPN-style tunnel, as in [TESTS-REAL.md](../TESTS-REAL.md)) still has to exclude the tailnet in its own settings. `fallback_source_ip` (or `source_ip` on an endpoint) binds the source address of `http://` connections.
 
-On a single-endpoint layout, omit `RELAY_FALLBACK_URL` and `fallback_url`. Do not point them at the same URL as the primary.
-
-Fallback requests use an opener with `ProxyHandler({})`, so they ignore `HTTP_PROXY` / the macOS system proxy. Primary requests use the default urllib opener, which follows the environment and, on macOS, the system proxy. Optional worker field `fallback_source_ip` binds the source address of fallback `http://` connections (the Mac’s own Tailscale IPv4) so scoped routing can prefer the Tailscale utun. It is not applied to the primary URL, and the handler does not cover `https://` fallbacks. The box client has no `fallback_source_ip`.
-
-A real run recorded in [TESTS-REAL.md](../TESTS-REAL.md) failed when a Mac system proxy (Shadowrocket) captured `100.64.0.0/10`. The proxy bypass above was added for the fallback URL only. A tailnet address used as `RELAY_URL` or `primary_url` does not get that bypass.
+Design, large-file handling and failure cases: [channels.md](channels.md).
 
 ### Smoke test
 
@@ -115,7 +110,7 @@ The server and the worker both run on the Mac. The box and the Mac are on the sa
 | Worker `primary_url` | `http://127.0.0.1:18790` (preferred) or the same `http://<mac-100.x>:18790` |
 | Worker `fallback_url` | unset |
 
-Prefer `http://127.0.0.1:18790` for the worker. It is the same process, and the primary URL does not bypass a system proxy. Use the Tailscale URL for the worker only when you have a reason to leave the machine; it is a valid base URL if `RELAY_BIND` includes that address.
+Prefer `http://127.0.0.1:18790` for the worker. It is the same process and does not depend on the tailnet. Use the Tailscale URL for the worker only when you have a reason to leave the machine; it is a valid base URL if `RELAY_BIND` includes that address.
 
 ### Prerequisites
 
@@ -230,8 +225,6 @@ Restart the agent after any env change. `RELAY_BIND` does not belong in this fil
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
   "max_soft_file": 16777216,
-  "fail_threshold": 3,
-  "cooldown_s": 300,
   "max_backoff_s": 60,
   "tools": {
     "hermes": ["/path/to/hermes", "run", "--prompt-file", "{prompt_file}", "--out", "{outbox}"],
@@ -243,13 +236,11 @@ Restart the agent after any env change. `RELAY_BIND` does not belong in this fil
 
 Leave `fallback_url` and `fallback_source_ip` out. `max_soft_file` is optional and only logged; the worker still uploads with PUT. The `tools` values are the placeholders from `examples/worker.example.json`; replace them with the commands you actually run. `secret_file` and `state_dir` expand `~`. The server LaunchAgent environment does not.
 
-The other legal `primary_url` is `http://100.x.y.z:18790` (this Mac’s Tailscale address). It has to survive the system proxy. `127.0.0.1` is the one to use unless that is unsuitable.
+The other legal `primary_url` is `http://100.x.y.z:18790` (this Mac’s Tailscale address). Tailnet addresses bypass the environment and macOS system proxy, but an OS-level VPN that captures `100.64.0.0/10` can still break it. `127.0.0.1` is the one to use unless that is unsuitable.
 
 ### Failover
 
-Not used. One base URL on each side. The box and the worker already retry their own long-poll with backoff when that URL is down. They will not switch anywhere else unless you set a second URL yourself.
-
-A second URL is worth adding only when you actually have one (layout 3). Inventing a fallback that points at the same host does nothing useful.
+Add channels only when you actually have a second relay, for example this layout as primary and the VPS relay as backup: `RELAY_FALLBACK_URL=https://relay.example.com/relay,http://100.x.y.z:18791` on the box and the same URLs after the primary in `endpoints` on the Mac. A second URL pointing at the same server adds nothing. See [channels.md](channels.md).
 
 ### Pros and cons
 
@@ -351,20 +342,18 @@ Follow the README “Mac install”. `~/.config/mac-relay/worker.json`, with `to
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
   "max_soft_file": 16777216,
-  "fail_threshold": 3,
-  "cooldown_s": 300,
   "max_backoff_s": 60,
   "tools": {}
 }
 ```
 
-Replace `100.x.y.z` with the box Tailscale address and replace `tools` with your real argv templates. An empty `tools` object starts the worker but fails every task (`no command template`). Omit `fallback_url` and `fallback_source_ip`. Delete a leftover `<state_dir>/conn.json` from an older config that had a fallback.
+Replace `100.x.y.z` with the box Tailscale address and replace `tools` with your real argv templates. An empty `tools` object starts the worker but fails every task (`no command template`). Omit `fallback_url` and `fallback_source_ip`.
 
-This `primary_url` is an `http://100.x` URL, so it uses the default opener and will follow a Mac system proxy. If Shadowrocket or another VPN routes `100.64.0.0/10` into the proxy, the worker cannot reach the box. Excluding the tailnet in that proxy is an OS setting. mac-relay will not do it for a primary URL. `fallback_source_ip` does not apply, because there is no fallback.
+This `primary_url` is an `http://100.x` URL. mac-relay bypasses `HTTP(S)_PROXY` and the macOS system proxy for tailnet addresses, but if Shadowrocket or another VPN routes `100.64.0.0/10` into its tunnel at the OS level, the worker cannot reach the box until that tool excludes the tailnet. To keep working through such an outage, add the VPS relay as a second endpoint ([channels.md](channels.md)).
 
 ### Failover
 
-Not used. The Mac has one URL. The box talks to localhost. When the Mac is offline the server keeps queued tasks in SQLite; they do not run until the worker long-polls again. When the box is offline, nothing is queued anywhere else.
+Add channels only when you actually have a second relay, for example this layout as primary and the VPS relay as backup: `RELAY_FALLBACK_URL=https://relay.example.com/relay,http://100.x.y.z:18791` on the box and the same URLs after the primary in `endpoints` on the Mac. A second URL pointing at the same server adds nothing. See [channels.md](channels.md).
 
 ### Pros and cons
 
@@ -478,8 +467,6 @@ RELAY_COOLDOWN_S=300
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
   "max_soft_file": 16777216,
-  "fail_threshold": 3,
-  "cooldown_s": 300,
   "max_backoff_s": 60,
   "tools": {}
 }
@@ -487,15 +474,13 @@ RELAY_COOLDOWN_S=300
 
 `100.x.y.z` is the server machine’s Tailscale address. `100.a.b.c` is the Mac’s own Tailscale address, and only on the worker, and only when `fallback_url` is `http://`. Omit `fallback_source_ip` rather than copying the descriptive text from `examples/worker.example.json`. The co-located client still uses `http://127.0.0.1:18790` alone. Replace the empty `tools` object from `examples/worker.example.json`.
 
-This split is deliberate: the tailnet URL sits on the fallback because that path skips the system proxy. Putting `http://100.x:18790` on `primary_url` and the tunnel on `fallback_url` inverts the implemented bypass.
+Either order works: every endpoint is polled at once, and tailnet URLs skip the proxy wherever they appear in the list. Put first the one you want results returned to by default.
 
 The box can be pointed at `https://<tunnel-host>` even when the server runs on the box. That hairpins through the tunnel. Prefer `http://127.0.0.1:18790` for the co-located agent so a tunnel outage does not stop local enqueue.
 
 ### Failover
 
-Unset unless the remote client has both URLs in the second example. Then the usual rule applies: three consecutive connection errors or HTTP 5xx on the tunnel URL, then sticky use of `http://100.x:18790`, then a primary `/health` probe after `cooldown_s`. `relay-send` tries the fallback on the first failure. A dead tunnel and a dead tailnet together have nowhere else to go. There is no third URL.
-
-The co-located localhost client does not fail over. If you previously saved a fallback mode, clear `<state_dir>/conn.json` or touch `reset-primary` after you remove `fallback_url`.
+Add channels only when you actually have a second relay, for example this layout as primary and the VPS relay as backup: `RELAY_FALLBACK_URL=https://relay.example.com/relay,http://100.x.y.z:18791` on the box and the same URLs after the primary in `endpoints` on the Mac. A second URL pointing at the same server adds nothing. See [channels.md](channels.md).
 
 ### Pros and cons
 

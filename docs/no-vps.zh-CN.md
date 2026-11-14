@@ -78,16 +78,11 @@ chmod 600 /path/to/secret
 
 ### 故障切换
 
-故障切换是可选的，只有设置了第二个基址才会发生。
+每个组件都可以同时使用多个中继服务器。box：`RELAY_URL` 加上逗号分隔的 `RELAY_FALLBACK_URL`。Mac：`worker.json` 里有序的 `endpoints` 列表（旧的 `primary_url` / `fallback_url` 仍可用）。worker 同时长轮询所有通道，`relay-box-agent` 同时消费所有通道的结果，`relay-send` 在 `RELAY_HANDOFF_S` 内 Mac 未接单时转交下一个通道。没有粘性模式，不再有 `conn.json`、`reset-primary`；`fail_threshold`、`cooldown_s`、`RELAY_FAIL_THRESHOLD`、`RELAY_COOLDOWN_S` 被忽略。同一任务 id 至多执行一次（Mac 上的台账），只唤醒一次（box 上的 `.wake`）。
 
-- box：`RELAY_FALLBACK_URL`。不设置就没有备用。`relay-box-agent` 在主地址连续失败 `RELAY_FAIL_THRESHOLD` 次后切换（默认 3）。失败指连接错误或 HTTP 状态 ≥ 500。HTTP 4xx 会把失败计数清零，不会切换。切换后停在备用地址上，每 `RELAY_COOLDOWN_S` 秒最多探一次 `主地址 + /health`（默认 300），成功才切回。模式只在内存里；重启 agent 会从主地址重新开始。`relay-send` 把阈值强制设成 1，如果这一次失败导致切到备用，会在备用地址上再入队一次。入队按任务 id 幂等。
-- Mac worker：`worker.json` 里的 `fallback_url`，加上 `fail_threshold`（默认 3）和 `cooldown_s`（默认 300）。同样是粘住不放。worker 把模式写在 `<state_dir>/conn.json`。重启后会继续用备用地址，直到探测成功，或者你 `touch <state_dir>/reset-primary`，或者 `kill -HUP <worker-pid>`。如果你删了 `fallback_url`，但 `conn.json` 里还写着 `"mode": "fallback"`，下一次请求会去找一个不存在的 URL。回到单地址时删掉 `conn.json`，或 touch `reset-primary`。
+访问 `100.x`、`*.ts.net`、`127.*`、`localhost` 时，所有通道（包括主通道）都绕过 `HTTP(S)_PROXY` 和 macOS 系统代理。如果代理在系统层接管了 `100.64.0.0/10`（类似 VPN 的隧道，见 [TESTS-REAL.md](../TESTS-REAL.md)），仍需在代理自身设置里排除 tailnet。`fallback_source_ip`（或 endpoint 上的 `source_ip`）用于绑定 `http://` 连接的源地址。
 
-单端点布局不要设 `RELAY_FALLBACK_URL` 和 `fallback_url`。不要把它们设成和主地址一样。
-
-备用请求用带 `ProxyHandler({})` 的 opener，因此忽略 `HTTP_PROXY` 和 macOS 系统代理。主地址请求用 urllib 的默认 opener，会跟着环境变量走，在 macOS 上还会跟着系统代理走。worker 的可选字段 `fallback_source_ip` 只给备用的 `http://` 连接绑定源地址（这台 Mac 自己的 Tailscale IPv4），让范围路由可以优先走 Tailscale 的 utun。它不作用于主地址，这个 handler 也不覆盖 `https://` 备用地址。box 客户端没有 `fallback_source_ip`。
-
-[TESTS-REAL.md](../TESTS-REAL.md) 里有一次真实运行：Mac 的系统代理（Shadowrocket）把 `100.64.0.0/10` 抓走了，备用地址全部失败。上面的代理绕过只加在备用 URL 上。写在 `RELAY_URL` 或 `primary_url` 里的 tailnet 地址不会绕过代理。
+设计、大文件处理和故障情形见 [channels.zh-CN.md](channels.zh-CN.md)。
 
 ### 冒烟
 
@@ -115,7 +110,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 | worker 的 `primary_url` | `http://127.0.0.1:18790`（优先）或同一个 `http://<Mac 的 100.x>:18790` |
 | worker 的 `fallback_url` | 不设置 |
 
-worker 优先用 `http://127.0.0.1:18790`。那就是同一个进程，而且主地址不会绕过系统代理。只有确实要绕出这台机器时，worker 才用 Tailscale URL；只要 `RELAY_BIND` 包含那个地址，它就是合法基址。
+worker 优先用 `http://127.0.0.1:18790`。那就是同一个进程，也不依赖 tailnet。只有确实要绕出这台机器时，worker 才用 Tailscale URL；只要 `RELAY_BIND` 包含那个地址，它就是合法基址。
 
 ### 前提
 
@@ -230,8 +225,6 @@ nohup bin/relay-box-agent >> /workspace/relay/agent.log 2>&1 &
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
   "max_soft_file": 16777216,
-  "fail_threshold": 3,
-  "cooldown_s": 300,
   "max_backoff_s": 60,
   "tools": {
     "hermes": ["/path/to/hermes", "run", "--prompt-file", "{prompt_file}", "--out", "{outbox}"],
@@ -243,13 +236,11 @@ nohup bin/relay-box-agent >> /workspace/relay/agent.log 2>&1 &
 
 不要写 `fallback_url` 和 `fallback_source_ip`。`max_soft_file` 可以不写，写了也只进日志；worker 仍然用 PUT 上传。`tools` 的值是 `examples/worker.example.json` 里的占位命令，换成你真正要跑的命令。`secret_file` 和 `state_dir` 会展开 `~`。服务器 LaunchAgent 的环境变量不会。
 
-另一个合法的 `primary_url` 是 `http://100.x.y.z:18790`（这台 Mac 自己的 Tailscale 地址）。它得扛得住系统代理。没有特殊原因就用 `127.0.0.1`。
+另一个合法的 `primary_url` 是 `http://100.x.y.z:18790`（这台 Mac 自己的 Tailscale 地址）。tailnet 地址会绕过环境变量和 macOS 系统代理，但在系统层接管 `100.64.0.0/10` 的 VPN 仍可能把它打断。没有特殊原因就用 `127.0.0.1`。
 
 ### 故障切换
 
-不用。每一侧只有一个基址。这个 URL 挂了的时候，box 和 worker 会按自己的退避重试长轮询。你自己不设第二个 URL，它们不会切到别处。
-
-只有真的有第二个地址时才值得加（布局 3）。造一个指向同一台机器的备用地址没有用。
+只有真的有第二个中继时才加通道，例如本方案为主、VPS 中继为备：box 上 `RELAY_FALLBACK_URL=https://relay.example.com/relay,http://100.x.y.z:18791`，Mac 的 `endpoints` 在主地址后面列上同样的 URL。指向同一台服务器的第二个 URL 没有意义。见 [channels.zh-CN.md](channels.zh-CN.md)。
 
 ### 好处和代价
 
@@ -351,20 +342,18 @@ RELAY_WAKE_DIR=/workspace/relay/wake
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
   "max_soft_file": 16777216,
-  "fail_threshold": 3,
-  "cooldown_s": 300,
   "max_backoff_s": 60,
   "tools": {}
 }
 ```
 
-把 `100.x.y.z` 换成 box 的 Tailscale 地址，把 `tools` 换成真实的 argv 模板。空的 `tools` 对象能让 worker 启动，但每个任务都会失败（`no command template`）。不要写 `fallback_url` 和 `fallback_source_ip`。如果旧配置有过备用地址，删掉残留的 `<state_dir>/conn.json`。
+把 `100.x.y.z` 换成 box 的 Tailscale 地址，把 `tools` 换成真实的 argv 模板。空的 `tools` 对象能让 worker 启动，但每个任务都会失败（`no command template`）。不要写 `fallback_url` 和 `fallback_source_ip`。
 
-这个 `primary_url` 是 `http://100.x`，走默认 opener，会跟着 Mac 的系统代理。如果 Shadowrocket 或其他 VPN 把 `100.64.0.0/10` 送进代理，worker 就到不了 box。在那个代理里排除 tailnet 是操作系统的设置。mac-relay 不会为主地址做这件事。没有备用地址时，`fallback_source_ip` 不起作用。
+这个 `primary_url` 是 `http://100.x`。mac-relay 对 tailnet 地址绕过 `HTTP(S)_PROXY` 和 macOS 系统代理；但如果 Shadowrocket 或其他 VPN 在系统层把 `100.64.0.0/10` 送进隧道，worker 在该工具排除 tailnet 之前到不了 box。想在这种情况下继续工作，就把 VPS 中继加成第二个通道（[channels.zh-CN.md](channels.zh-CN.md)）。
 
 ### 故障切换
 
-不用。Mac 只有一个 URL。box 访问的是 localhost。Mac 离线时，服务器把任务留在 SQLite 队列里；worker 再次长轮询之前不会执行。box 离线时，没有别的地方可以入队。
+只有真的有第二个中继时才加通道，例如本方案为主、VPS 中继为备：box 上 `RELAY_FALLBACK_URL=https://relay.example.com/relay,http://100.x.y.z:18791`，Mac 的 `endpoints` 在主地址后面列上同样的 URL。指向同一台服务器的第二个 URL 没有意义。见 [channels.zh-CN.md](channels.zh-CN.md)。
 
 ### 好处和代价
 
@@ -478,8 +467,6 @@ RELAY_COOLDOWN_S=300
   "state_dir": "~/Library/Application Support/mac-relay",
   "worker_name": "mac",
   "max_soft_file": 16777216,
-  "fail_threshold": 3,
-  "cooldown_s": 300,
   "max_backoff_s": 60,
   "tools": {}
 }
@@ -487,15 +474,13 @@ RELAY_COOLDOWN_S=300
 
 `100.x.y.z` 是跑服务器那台机器的 Tailscale 地址。`100.a.b.c` 是这台 Mac 自己的 Tailscale 地址，只写在 worker 上，而且只在 `fallback_url` 是 `http://` 的时候写。不要把 `examples/worker.example.json` 里那段说明文字抄进 `fallback_source_ip`。和服务器在同一台机器上的客户端仍然只用 `http://127.0.0.1:18790`。空的 `tools` 对象用 `examples/worker.example.json` 里的内容换掉。
 
-这样拆是有意的：tailnet URL 放在备用地址上，因为那条路径会跳过系统代理。把 `http://100.x:18790` 放进 `primary_url`、把隧道放进 `fallback_url`，就和代码里的代理绕过反了。
+两种顺序都可以：所有通道同时轮询，tailnet URL 在列表任何位置都绕过代理。默认希望结果回到哪个通道，就把它放第一。
 
 即使服务器就跑在 box 上，也可以把 box 指到 `https://<tunnel-host>`。那样会从隧道绕一圈回来。和服务器在一起的 agent 优先用 `http://127.0.0.1:18790`，这样隧道断了也不会挡住本机入队。
 
 ### 故障切换
 
-没有第二行示例里的两个 URL，就不要设置。远端客户端两个都有时，用平时的规则：隧道 URL 上连续 3 次连接错误或 HTTP 5xx，然后粘在 `http://100.x:18790` 上，`cooldown_s` 之后再探主地址的 `/health`。`relay-send` 第一次失败就会试备用。隧道和 tailnet 一起断了，没有第三个地址。
-
-本机的 localhost 客户端不做故障切换。如果你以前存过备用模式，去掉 `fallback_url` 之后清掉 `<state_dir>/conn.json`，或 touch `reset-primary`。
+只有真的有第二个中继时才加通道，例如本方案为主、VPS 中继为备：box 上 `RELAY_FALLBACK_URL=https://relay.example.com/relay,http://100.x.y.z:18791`，Mac 的 `endpoints` 在主地址后面列上同样的 URL。指向同一台服务器的第二个 URL 没有意义。见 [channels.zh-CN.md](channels.zh-CN.md)。
 
 ### 好处和代价
 

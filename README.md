@@ -8,6 +8,8 @@ box bot ──relay-send──▶ relay server (VPS, behind Caddy /relay/) ◀�
    └──done/failed wake◀──relay-box-agent (long-poll results)
 ```
 
+* Several relay servers can be used at once (for example a box relay over Tailscale as primary and a VPS relay as backup). Every component talks to every channel; there is no sticky failover state. See [docs/channels.md](docs/channels.md).
+* Large files: chunked, resumable, sha256-checked uploads; Range-resumed, verified downloads. A partial file never appears under its final name.
 * Python 3 standard library only. No other dependencies.
 * State is kept in SQLite under `RELAY_DATA_DIR`. Enqueueing is idempotent on task id, and the first result for a task is the only one stored.
 * Workers wait on long-polls, not timers. There is no heartbeat routine and no cron job.
@@ -16,6 +18,7 @@ box bot ──relay-send──▶ relay server (VPS, behind Caddy /relay/) ◀�
 ## API
 | Method | Path | Purpose |
 |---|---|---|
+| GET | `/status` | Authenticated. Protocol version, `features`, and worker last-seen seconds. 404 on servers older than v2 |
 | GET | `/health` | Unauthenticated. Default body `{"ok": true, "soft_body": 16777216, "max_body": 536870912}` |
 | POST | `/tasks` | Enqueue (multipart or JSON): `id, sender, tool∈{hermes,deepseek,codex}, prompt`, plus file parts as attachments. Multipart is capped at `RELAY_MAX_SOFT_BODY` (16MiB) |
 | GET | `/tasks/next?worker=mac&wait=50` | Worker long-poll. Returns 200 with a task, or 204 |
@@ -61,7 +64,7 @@ Worker outputs use the PUT path. For each stdout, stderr, and outbox file, `mac/
 
 `files` is an array of names already on disk under that task's `out` directory. A name that was not PUT is ignored. `max_soft_file` in `worker.json` (default 16MiB) is written to the worker log at startup. It does not change the upload path: the worker always uses PUT + JSON.
 
-**Task input attachments sent by the box client (`bin/relay-send --file`) still go as multipart and are still capped at 16MiB.** `relay-send` does not call PUT. This is not two-way large-file support. Only worker outputs are streamed. A box that needs to hand the Mac a larger input has to do that outside the enqueue body.
+**Task input attachments (`bin/relay-send --file`)**: on a v2 server the task is created `staged`, each file goes up with chunked resumable PUT (`kind=in`, sha256 checked), then `POST /tasks/{id}/commit` makes it claimable. Old servers still get multipart, capped at 16MiB. Chunked PUT, Range downloads, and the other v2 calls are described in [docs/channels.md](docs/channels.md).
 
 Upgrade a relay that is already running: replace `relay/server.py` and `mac/relay-worker.py`, then restart the server and the worker in the same window. The systemd unit does not need a new setting. An old worker can still POST a multipart result of at most 16MiB. A larger multipart result gets 413 until that worker is updated, and the server closes the connection instead of buffering it. Caddy's `request_body max_size 512MB` matches `RELAY_MAX_BODY`. It does not lift the 16MiB multipart cap.
 
@@ -73,7 +76,7 @@ The install above is the primary path: a Linux VPS, systemd, and Caddy in front 
 2. **Relay on the box.** The box runs the server and uses `RELAY_URL=http://127.0.0.1:18790`. The Mac worker uses `primary_url=http://<box-100.x>:18790`. The queue stays up when the Mac sleeps; tasks do not run until the worker is online.
 3. **Local relay plus a tunnel.** The server stays on the Mac or the box. Cloudflare Tunnel or Tailscale Funnel gives the other side an HTTPS base URL. When the tunnel targets port 18790 directly, that URL has no `/relay` suffix. The bearer secret is mandatory, because the URL is reachable past the tailnet.
 
-On a single URL, leave `RELAY_FALLBACK_URL` / `fallback_url` unset. Set them only when you really have two base URLs, for example a tunnel URL plus `http://100.x:18790`.
+On a single URL, leave `RELAY_FALLBACK_URL` / extra `endpoints` unset. With two relays (for example layout 2 as primary plus the VPS as backup) list both; see [docs/channels.md](docs/channels.md).
 
 ## Box install
 ```sh
@@ -90,7 +93,7 @@ bin/relay-send <slug> codex 'summarise this' --file notes.md   # stdout: task id
 
 The agent wakes the sender once, on `done`/`failed`, after downloading `/workspace/relay-results/<id>/{result.json, files…}`. It does not POST the sender webhook for `status=started`. A stale started event is acked and recorded in `.wake-started` as `skipped/no-webhook`. The done/failed wake is at-most-once (`.wake`). Body shape is `{task_id, status, summary, sender, result_path}`. If a slug has no `.url`/`.key`, that wake logs one error and does not retry.
 
-**Box fallback:** set `RELAY_FALLBACK_URL` (for example `http://100.x.y.z:18791`, a Tailscale address of the relay host). `relay-box-agent` uses the same policy as the worker: it switches after `RELAY_FAIL_THRESHOLD` (default 3) consecutive primary failures (connection error or HTTP 5xx), stays on the fallback, and probes the primary `/health` once per `RELAY_COOLDOWN_S` (default 300) before switching back. Fallback requests bypass any proxy. The log shows `connection -> fallback` / `connection -> primary`. `relay-send` also retries once on `RELAY_FALLBACK_URL` if the primary fails (enqueue is idempotent by task id). Restart the agent after changing the env.
+**More channels:** `RELAY_FALLBACK_URL` is a comma-separated list of backup base URLs. `relay-box-agent` long-polls results on all of them at once and wakes once per task id. `relay-send` enqueues on the first channel that answers and hands the same task id to the next channel if the Mac has not accepted it within `RELAY_HANDOFF_S` (default 20), withdrawing the first copy. Requests to `100.x`, `*.ts.net`, and localhost bypass any proxy. Long prompts: `relay-send <slug> <tool> - < prompt.txt` or `--prompt-file`. Restart the agent after changing the env. Details and failure cases: [docs/channels.md](docs/channels.md).
 
 ## Mac install
 ```sh
@@ -110,7 +113,7 @@ Tool templates are argv lists. They can use `{prompt} {prompt_file} {inbox} {out
 
 One task's upload failure does not stop the others in that sweep. On HTTP errors the worker logs the response body. `upload_4xx_quarantine` (default 3) consecutive HTTP 4xx responses write a `quarantine` marker in the task directory and stop retries. The count is the `upload-4xx` file in that directory (it survives restarts). The task's files are left in place.
 
-**Fallback:** set `fallback_url` (for example a Tailscale address) to use when the primary is down. The worker switches to it only after `fail_threshold` consecutive primary failures, and then stays on it. It goes back to the primary only when a `/health` probe succeeds after `cooldown_s`, or when you reset it manually with `touch <state_dir>/reset-primary` or `kill -HUP <pid>`. Retry backoff is exponential and capped at `max_backoff_s`.
+**Channels:** `endpoints` is an ordered list of `{"name", "url"}` (first = primary). The worker long-polls all of them at once; a task id claimed twice runs once. Results go back where the task came from; after `mirror_after_s` (default 60) without success and without upload progress, the worker mirrors the task to another channel and delivers there, then closes the stale row on the origin after `closeout_after_s` (default 600). Old configs with `primary_url` / `fallback_url` still work; `fail_threshold`, `cooldown_s`, `conn.json` and `reset-primary` are no longer used. Retry backoff is exponential and capped at `max_backoff_s`. `stdin_prompt_over` (`{"tool": bytes}`) passes long prompts on stdin. See [docs/channels.md](docs/channels.md).
 
 ## Tests
 `python3 tests/selftest.py` runs everything over loopback, with stub tools and a stub webhook, and writes `TESTS.md`. `--quick` shortens the long task.
