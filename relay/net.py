@@ -4,6 +4,9 @@
 import hashlib, http.client, json, os, socket, threading, time, urllib.error, urllib.parse, urllib.request
 
 CHUNK_BYTES = 8 * 1024 * 1024
+# Public HTTPS is not a tailnet/loopback URL. An 8MiB body there timed out with no HTTP
+# status (live partial stopped at 7MiB). One-mebibyte bodies stay inside a normal window.
+PUBLIC_CHUNK_BYTES = 1024 * 1024
 
 
 def qseg(s):
@@ -16,6 +19,23 @@ def is_direct(url):
     host = (urllib.parse.urlparse(url).hostname or "").rstrip(".").lower()
     return (host.startswith("100.") or host.endswith(".ts.net") or host.startswith("127.")
             or host in ("localhost", "::1"))
+
+
+def chunk_bytes(url=None, env=None):
+    """Bytes per chunked PUT. RELAY_CHUNK_BYTES overrides. Otherwise public URLs use 1MiB
+    and direct URLs keep 8MiB. Clamped to 64KiB..8MiB."""
+    env = os.environ if env is None else env
+    raw = env.get("RELAY_CHUNK_BYTES")
+    if raw not in (None, ""):
+        try:
+            n = int(raw)
+        except ValueError:
+            n = PUBLIC_CHUNK_BYTES
+    elif url and not is_direct(url):
+        n = PUBLIC_CHUNK_BYTES
+    else:
+        n = CHUNK_BYTES
+    return min(CHUNK_BYTES, max(64 * 1024, n))
 
 
 class _Watch:
@@ -53,6 +73,62 @@ class _Reg(threading.local):
         self.conns = []
 
 
+def _note_early(conn, exc):
+    """If the server answered and closed while the body was still uploading, keep that
+    response on the OSError. urllib otherwise turns the reset into URLError and drops it."""
+    try:
+        sock = conn.sock
+        if sock is None:
+            return
+        sock.settimeout(1)
+        resp = conn.getresponse()
+        body = resp.read(65536)
+        if int(resp.status) < 400:
+            return
+        exc.early_status = int(resp.status)
+        exc.early_reason = resp.reason if isinstance(resp.reason, str) else ""
+        exc.early_body = bytes(body or b"")
+    except Exception:
+        return
+
+
+def _early_response(exc):
+    """(status, reason, body) stashed by _note_early, walking URLError.reason / __context__."""
+    cur, seen = exc, set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        status = getattr(cur, "early_status", None)
+        if isinstance(status, int):
+            body = getattr(cur, "early_body", b"") or b""
+            reason = getattr(cur, "early_reason", "") or ""
+            return status, str(reason), body
+        nxt = getattr(cur, "reason", None)
+        if not isinstance(nxt, BaseException):
+            nxt = getattr(cur, "__context__", None)
+        if not isinstance(nxt, BaseException) or nxt is cur:
+            return None
+        cur = nxt
+    return None
+
+
+class _EarlyBody:
+    """If the peer closes mid-body, keep a 4xx that urllib would otherwise drop."""
+    def _send_output(self, message_body=None, encode_chunked=False):
+        try:
+            super()._send_output(message_body, encode_chunked)
+        except OSError as e:
+            _note_early(self, e)
+            raise
+
+
+class _HTTPConn(_EarlyBody, http.client.HTTPConnection):
+    pass
+
+
+class _HTTPSConn(_EarlyBody, http.client.HTTPSConnection):
+    pass
+
+
 class _HTTP(urllib.request.HTTPHandler):
     def __init__(self, reg, src=None):
         super().__init__(); self.reg, self.src = reg, src
@@ -61,7 +137,7 @@ class _HTTP(urllib.request.HTTPHandler):
         def mk(host, **kw):
             if self.src:
                 kw["source_address"] = (self.src, 0)
-            c = http.client.HTTPConnection(host, **kw); self.reg.conns.append(c); return c
+            c = _HTTPConn(host, **kw); self.reg.conns.append(c); return c
         return self.do_open(mk, req)
 
 
@@ -71,7 +147,7 @@ class _HTTPS(urllib.request.HTTPSHandler):
 
     def https_open(self, req):
         def mk(host, **kw):
-            c = http.client.HTTPSConnection(host, **kw); self.reg.conns.append(c); return c
+            c = _HTTPSConn(host, **kw); self.reg.conns.append(c); return c
         return self.do_open(mk, req, context=self._context)
 
 
@@ -170,6 +246,13 @@ class Endpoint:
             (self._fail(e) if e.code >= 500 else self._ok())
             raise
         except Exception as e:
+            early = _early_response(e)
+            if early:
+                status, reason, raw = early
+                err = urllib.error.HTTPError(r.full_url, status, reason or "error", None, None)
+                err.relay_body = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+                (self._fail(err) if status >= 500 else self._ok())
+                raise err from e
             if w.fired:
                 e2 = TimeoutError(f"{self.name}: stalled or past deadline ({method} {path.split('?')[0]})")
                 self._fail(e2); raise e2 from e
@@ -225,11 +308,47 @@ class Mismatch(Exception):
     """Checksum or size verification failed; the partial data was discarded."""
 
 
-def upload_file(ep, tid, kind, path, name, chunk=CHUNK_BYTES, stall=60, log=None):
+# How many times a 400 short body may come back without the resume point moving.
+# Progress (partial > offset just sent) is bounded by the file size, since the offset only grows.
+_SHORT_STALLS = 2
+# 409 busy means the previous request still holds the upload. Retry a few times, then
+# give up so the caller can use another channel instead of looping forever.
+_BUSY_TRIES = 4
+# A transport timeout with no growth of the server partial. Progress is not capped here:
+# the offset only moves forward.
+_TRANSPORT_TRIES = 2
+
+
+def _short_partial(err, size, sent):
+    """Resume offset for a validated 400 {"error":"short body","partial":N}, else None.
+
+    N must be an int (not a bool) and sent <= N <= size. A missing/malformed partial, a
+    different error (bad name, bad offset/total), or N < sent is not this case: the caller
+    raises and leaves fatal 400 handling unchanged. N == sent is valid but made no progress.
+    """
+    if getattr(err, "code", None) != 400:
+        return None
+    try:
+        j = json.loads(getattr(err, "relay_body", "") or "")
+    except ValueError:
+        return None
+    if not isinstance(j, dict) or j.get("error") != "short body" or "partial" not in j:
+        return None
+    p = j.get("partial")
+    if type(p) is not int or p < sent or p > size:
+        return None
+    return p
+
+
+def upload_file(ep, tid, kind, path, name, chunk=None, stall=60, log=None):
     """Upload one file as `name` (may contain '/' on new servers). New servers: chunked PUT
     with offset; resumes from the server's partial size; the server checks sha256 before the
-    file becomes visible. Old servers: one streaming PUT. Returns {"name","size","sha256"}."""
+    file becomes visible. A 400 short body whose partial is in range resumes in this attempt.
+    A transport timeout re-reads GET /uploads and continues from that partial. Old servers:
+    one streaming PUT. Returns {"name","size","sha256"}."""
     log = log or (lambda *a: None)
+    if chunk is None:
+        chunk = chunk_bytes(ep.url)
     size, sha = os.path.getsize(path), sha256_file(path)
     meta = {"name": name, "size": size, "sha256": sha}
     base = f"/tasks/{qseg(tid)}/files/{qseg(name)}?kind={kind}"
@@ -245,6 +364,9 @@ def upload_file(ep, tid, kind, path, name, chunk=CHUNK_BYTES, stall=60, log=None
     reset = off > size
     if off and not reset:
         log("resume", tid, name, f"{off}/{size}", "on", ep.name)
+    stalls = 0  # consecutive short bodies that did not advance
+    busy = 0
+    transport = 0
     with open(path, "rb") as f:
         while True:
             if reset:
@@ -269,13 +391,52 @@ def upload_file(ep, tid, kind, path, name, chunk=CHUNK_BYTES, stall=60, log=None
                     except ValueError:
                         j = {}
                     off, reset = int(j.get("partial") or 0), False
+                    stalls = 0
                     if j.get("busy"):
-                        time.sleep(2)
+                        busy += 1
+                        if busy > _BUSY_TRIES:
+                            raise ConnectionError(f"{ep.name}: upload still busy") from e
+                        time.sleep(0.5)
+                    else:
+                        busy = 0
                     continue
+                p = _short_partial(e, size, off)
+                if p is not None and p > off:
+                    off, reset, stalls = p, False, 0
+                    log("resume", tid, name, f"{off}/{size}", "on", ep.name)
+                    continue
+                if p is not None:
+                    stalls += 1
+                    if stalls <= _SHORT_STALLS:
+                        continue
                 if e.code == 422:
                     raise Mismatch(f"{name}: server sha256 mismatch") from e
                 raise
+            except (TimeoutError, urllib.error.URLError) as e:
+                # No HTTP status. The server may still have kept bytes (live: 7MiB of an 8MiB body).
+                try:
+                    _, s = ep.json("GET", f"/uploads/{qseg(tid)}/{qseg(name)}?kind={kind}",
+                                   deadline=20, stall=15)
+                except Exception:
+                    raise e
+                if s.get("complete") and s.get("size") == size and s.get("sha256") == sha:
+                    return meta
+                try:
+                    p = int(s.get("partial") or 0)
+                except (TypeError, ValueError):
+                    raise e
+                if p > off and p <= size:
+                    off, reset, stalls, busy, transport = p, False, 0, 0, 0
+                    log("resume", tid, name, f"{off}/{size}", "on", ep.name)
+                    continue
+                transport += 1
+                if transport > _TRANSPORT_TRIES:
+                    raise
+                continue
             reset = False
+            stalls = 0
+            busy = 0
+            transport = 0
             if j.get("complete"):
                 return meta
             off = int(j.get("partial", off + n))

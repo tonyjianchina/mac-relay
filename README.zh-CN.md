@@ -44,9 +44,9 @@ Worker 的输出走另一条路径。每个 stdout、stderr 和 outbox 文件先
 ## Mac 端
 复制 `mac/relay-worker.py` 和 `examples/worker.example.json`，修改其中的 URL 和工具命令模板，再用 `mac/com.example.mac-relay.worker.plist` 生成 LaunchAgent（替换 `__占位符__`）。每个任务作为独立的后台子进程运行，没有超时。工具写进 outbox 的非空文件会连同 stdout、stderr 以流式 PUT 上传，结果 POST 是 JSON（`files` 列出这些文件名）。worker 重启后会补传已完成但还没确认上传的结果。某一个任务上传失败不会挡住同一次扫描里的其他任务。HTTP 错误会把响应体写进日志。连续 `upload_4xx_quarantine` 次（默认 3）HTTP 4xx 会在任务目录里写下 `quarantine` 标记并不再重试；次数记在该目录的 `upload-4xx` 文件里（重启还在）。任务文件会留在原地。
 
-**多通道：** `endpoints` 是有序的 `{"name", "url"}` 列表（第一个为主）。worker 同时长轮询所有通道；同一任务 id 被认领两次也只执行一次。结果回到接单的通道；连续 `mirror_after_s`（默认 60 秒）既没成功也没有上传进展时，镜像到其他通道交付，并在 `closeout_after_s`（默认 600 秒）后关闭原通道上的陈旧行。旧配置 `primary_url` / `fallback_url` 仍可用；`fail_threshold`、`cooldown_s`、`conn.json`、`reset-primary` 不再使用。`stdin_prompt_over`（`{"工具": 字节数}`）让长 prompt 走 stdin。
+**多通道：** `endpoints` 是有序的 `{"name", "url"}` 列表（第一个为主）。worker 同时长轮询所有通道；同一任务 id 被认领两次也只执行一次。结果回到接单的通道。超过 `big_bytes`（默认 8 MiB）时先走公网 https 端点（`public_endpoint` 可指定名称或 URL）。连续 `mirror_after_s`（默认 60 秒）既没成功也没有上传进展时，镜像到其他通道交付，并在 `closeout_after_s`（默认 600 秒）后关闭原通道上的陈旧行。旧配置 `primary_url` / `fallback_url` 仍可用；`fail_threshold`、`cooldown_s`、`conn.json`、`reset-primary` 不再使用。`stdin_prompt_over`（`{"工具": 字节数}`）让长 prompt 走 stdin。
 
-box 端：`RELAY_FALLBACK_URL` 是逗号分隔的备用基址列表。`relay-box-agent` 同时在所有通道上长轮询结果，同一任务 id 只唤醒一次。`relay-send` 发到第一个可用通道；`RELAY_HANDOFF_S`（默认 20 秒）内 Mac 未接单，就把同一任务 id 转交下一个通道并撤回原副本。访问 `100.x`、`*.ts.net`、localhost 不走代理。长 prompt 用 `relay-send <slug> <tool> - < prompt.txt` 或 `--prompt-file`。改了 env 要重启 box-agent。每条任务只唤醒一次（`done` 或 `failed`）。接单不走 webhook。详情和故障情形见 [docs/channels.zh-CN.md](docs/channels.zh-CN.md)。
+box 端：`RELAY_FALLBACK_URL` 是逗号分隔的备用基址列表。`relay-box-agent` 同时在所有通道上长轮询结果，同一任务 id 只唤醒一次。`relay-send` 发到第一个可用通道；`RELAY_HANDOFF_S`（默认 20 秒）内 Mac 未接单，就把同一任务 id 转交下一个通道并撤回原副本。合计 `--file` 超过 `RELAY_BIG_BYTES`（默认 8 MiB）时，先发到 `RELAY_FALLBACK_URL` 里的公网地址。访问 `100.x`、`*.ts.net`、localhost 不走代理。长 prompt 用 `relay-send <slug> <tool> - < prompt.txt` 或 `--prompt-file`。改了 env 要重启 box-agent。每条任务只唤醒一次（`done` 或 `failed`）。接单不走 webhook。详情和故障情形见 [docs/channels.zh-CN.md](docs/channels.zh-CN.md)。
 
 ## 测试
 运行 `python3 tests/selftest.py`，结果写在 TESTS.md。
